@@ -1,0 +1,30 @@
+# Python Virtual Environment
+backend/venv/
+backend/__pycache__/
+
+# Python
+*.pyc
+
+# Environment Variables
+.env
+backend/.env
+frontend/.env
+
+# Node Modules
+frontend/node_modules/
+
+# React Build
+frontend/dist/
+
+# Uploads
+backend/uploads/
+
+# ChromaDB
+backend/chroma_db/
+
+# VS Code
+.vscode/
+
+# OS Files
+.DS_Store
+Thumbs.db
