@@ -3,24 +3,44 @@ import ForceGraph2D from "react-force-graph-2d";
 
 const API = "http://127.0.0.1:8000";
 
-// Color by entity label category
+// ── Color palette by entity label ────────────────────────────────────────────
 const GROUP_COLORS = {
-  ORG:      "#6c63ff",
-  PERSON:   "#1fc791",
-  GPE:      "#f5a623",
-  LOC:      "#e05252",
-  PRODUCT:  "#47a8e5",
+  ORG:         "#6c63ff",
+  PERSON:      "#1fc791",
+  GPE:         "#f5a623",
+  LOC:         "#e05252",
+  PRODUCT:     "#47a8e5",
   WORK_OF_ART: "#c47aff",
-  EVENT:    "#ff6b6b",
-  RELATION: "#9999aa",
-  DEFAULT:  "#555568",
+  EVENT:       "#ff6b6b",
+  FAC:         "#ff9f43",
+  LANGUAGE:    "#54a0ff",
+  LAW:         "#5f27cd",
+  NORP:        "#00d2d3",
+  RELATION:    "#555568",
+  DEFAULT:     "#444458",
+};
+
+// Human-readable descriptions for the legend
+const GROUP_LABELS = {
+  ORG:         "Organization",
+  PERSON:      "Person",
+  GPE:         "Place / Country",
+  LOC:         "Location",
+  PRODUCT:     "Product",
+  WORK_OF_ART: "Work of Art",
+  EVENT:       "Event",
+  FAC:         "Facility",
+  LANGUAGE:    "Language",
+  LAW:         "Law / Regulation",
+  NORP:        "Group / Nationality",
+  RELATION:    "Relation (inferred)",
 };
 
 function groupColor(group) {
   return GROUP_COLORS[group] || GROUP_COLORS.DEFAULT;
 }
 
-// Memoized graph data transformation — avoids re-running on every render
+// ── Graph data builder ────────────────────────────────────────────────────────
 function buildGraphData(rawGraph) {
   const nodes = [];
   const links = [];
@@ -38,7 +58,7 @@ function buildGraphData(rawGraph) {
     (item.relationships || []).forEach(rel => {
       const src = rel.subject?.trim();
       const tgt = rel.object?.trim();
-      const lbl = rel.relation?.trim();
+      const lbl = rel.relation?.trim() || "→";
       if (!src || !tgt || src.length < 2 || tgt.length < 2) return;
 
       links.push({ source: src, target: tgt, label: lbl });
@@ -57,12 +77,18 @@ function buildGraphData(rawGraph) {
   return { nodes, links };
 }
 
+// ── Truncate helper ───────────────────────────────────────────────────────────
+const truncate = (s, n) => (s && s.length > n ? s.slice(0, n) + "…" : s);
+
+// ── Component ─────────────────────────────────────────────────────────────────
 export default function KnowledgeGraph() {
   const [rawGraph, setRawGraph] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [selectedNode, setSelectedNode] = useState(null);
+  const [hoveredLink, setHoveredLink] = useState(null);
   const containerRef = useRef(null);
+  const fgRef = useRef(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 500 });
 
   const graphData = useMemo(() => buildGraphData(rawGraph), [rawGraph]);
@@ -100,6 +126,7 @@ export default function KnowledgeGraph() {
     setSelectedNode(prev => prev?.id === node.id ? null : node);
   }, []);
 
+  // Connections for the selected node detail panel
   const nodeConnections = useMemo(() => {
     if (!selectedNode) return [];
     return graphData.links
@@ -108,54 +135,118 @@ export default function KnowledgeGraph() {
         const tgt = typeof l.target === "object" ? l.target.id : l.target;
         return src === selectedNode.id || tgt === selectedNode.id;
       })
-      .slice(0, 6);
+      .slice(0, 8);
   }, [selectedNode, graphData.links]);
 
-  // Custom node painter
+  // ── Custom node painter ───────────────────────────────────────────────────
   const paintNode = useCallback((node, ctx, globalScale) => {
     const label = node.id;
     const fontSize = Math.max(10 / globalScale, 3);
+    const isSelected = selectedNode?.id === node.id;
     const r = node.isEntity ? 6 : 4;
     const color = groupColor(node.group);
 
-    // ring for selected
-    if (selectedNode?.id === node.id) {
+    // Glow ring for selected node
+    if (isSelected) {
+      const gradient = ctx.createRadialGradient(node.x, node.y, r, node.x, node.y, r + 8);
+      gradient.addColorStop(0, `${color}55`);
+      gradient.addColorStop(1, `${color}00`);
       ctx.beginPath();
-      ctx.arc(node.x, node.y, r + 3, 0, 2 * Math.PI);
-      ctx.fillStyle = `${color}33`;
+      ctx.arc(node.x, node.y, r + 8, 0, 2 * Math.PI);
+      ctx.fillStyle = gradient;
       ctx.fill();
+
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, r + 2.5, 0, 2 * Math.PI);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5 / globalScale;
+      ctx.stroke();
     }
 
+    // Node circle with subtle inner highlight
     ctx.beginPath();
     ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
     ctx.fillStyle = color;
     ctx.fill();
 
-    if (globalScale > 0.6) {
+    // Tiny white specular dot
+    if (globalScale > 0.5) {
+      ctx.beginPath();
+      ctx.arc(node.x - r * 0.28, node.y - r * 0.28, r * 0.28, 0, 2 * Math.PI);
+      ctx.fillStyle = "rgba(255,255,255,0.25)";
+      ctx.fill();
+    }
+
+    // Label — only when zoomed in enough
+    if (globalScale > 0.55) {
       ctx.font = `${fontSize}px "IBM Plex Sans", sans-serif`;
-      ctx.fillStyle = "#f0f0f5";
+      ctx.fillStyle = isSelected ? color : "#c0c0d0";
       ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      const maxLen = 18;
-      const displayLabel = label.length > maxLen ? label.slice(0, maxLen) + "…" : label;
-      ctx.fillText(displayLabel, node.x, node.y + r + fontSize + 1);
+      ctx.textBaseline = "top";
+      ctx.fillText(truncate(label, 20), node.x, node.y + r + 2);
     }
   }, [selectedNode]);
 
+  // ── Custom link painter (shows relation label on hover) ───────────────────
+  const paintLink = useCallback((link, ctx, globalScale) => {
+    const src = link.source;
+    const tgt = link.target;
+    if (!src || !tgt || src.x == null || tgt.x == null) return;
+
+    const isHovered = hoveredLink === link;
+
+    ctx.beginPath();
+    ctx.moveTo(src.x, src.y);
+    ctx.lineTo(tgt.x, tgt.y);
+    ctx.strokeStyle = isHovered ? "#6c63ff88" : "#2a2a4488";
+    ctx.lineWidth = isHovered ? 1.5 / globalScale : 0.8 / globalScale;
+    ctx.stroke();
+
+    // Draw relation label at the midpoint when hovered or zoomed in
+    if ((isHovered || globalScale > 1.2) && link.label) {
+      const mx = (src.x + tgt.x) / 2;
+      const my = (src.y + tgt.y) / 2;
+      const fontSize = Math.max(8 / globalScale, 2.5);
+
+      ctx.font = `italic ${fontSize}px "IBM Plex Sans", sans-serif`;
+      const text = link.label;
+      const tw = ctx.measureText(text).width;
+
+      // Pill background
+      const pad = 2 / globalScale;
+      ctx.fillStyle = "rgba(15,15,19,0.85)";
+      ctx.fillRect(mx - tw / 2 - pad, my - fontSize / 2 - pad, tw + pad * 2, fontSize + pad * 2);
+
+      ctx.fillStyle = isHovered ? "#8b84ff" : "#6666aa";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(text, mx, my);
+    }
+  }, [hoveredLink]);
+
+  // Unique groups actually present in the current graph (for legend)
   const uniqueGroups = useMemo(() => {
     const seen = new Set();
     return graphData.nodes
       .map(n => n.group)
       .filter(g => { if (seen.has(g)) return false; seen.add(g); return true; })
-      .slice(0, 6);
+      .slice(0, 7);
   }, [graphData.nodes]);
+
+  // ── Zoom to fit ───────────────────────────────────────────────────────────
+  const handleZoomFit = () => {
+    fgRef.current?.zoomToFit(400, 40);
+  };
 
   return (
     <div className="graph-wrap">
+      {/* ── Toolbar ── */}
       <div className="graph-toolbar">
         <div>
           <div className="page-title">Knowledge Graph</div>
-          <div className="page-subtitle">Entities and relationships extracted from documents</div>
+          <div className="page-subtitle">
+            Entities and relationships extracted using spaCy's dependency parser
+          </div>
         </div>
         <div className="graph-stats">
           <span className="graph-stat"><strong>{graphData.nodes.length}</strong> nodes</span>
@@ -163,11 +254,22 @@ export default function KnowledgeGraph() {
         </div>
         <button
           className="btn"
+          onClick={handleZoomFit}
+          disabled={graphData.nodes.length === 0}
+          aria-label="Zoom to fit"
+          title="Zoom to fit all nodes"
+        >
+          <i className="ti ti-focus-2" aria-hidden="true" />
+          Fit
+        </button>
+        <button
+          className="btn"
           onClick={fetchGraph}
           disabled={loading}
           aria-label="Refresh graph"
         >
-          <i className={`ti ${loading ? "ti-loader-2" : "ti-refresh"}`}
+          <i
+            className={`ti ${loading ? "ti-loader-2" : "ti-refresh"}`}
             style={loading ? { animation: "spin 1s linear infinite" } : {}}
             aria-hidden="true"
           />
@@ -175,6 +277,7 @@ export default function KnowledgeGraph() {
         </button>
       </div>
 
+      {/* ── Canvas ── */}
       <div className="graph-canvas" ref={containerRef}>
         {error && (
           <div className="empty-state" style={{ position: "absolute", inset: 0 }}>
@@ -189,30 +292,39 @@ export default function KnowledgeGraph() {
           <div className="empty-state" style={{ position: "absolute", inset: 0 }}>
             <i className="ti ti-share-2" />
             <h3>No graph data yet</h3>
-            <p>Upload documents to automatically extract entities and relationships.</p>
+            <p>
+              Upload documents to automatically extract named entities and
+              subject-verb-object relationships.
+            </p>
           </div>
         )}
 
         {graphData.nodes.length > 0 && (
           <ForceGraph2D
+            ref={fgRef}
             graphData={graphData}
             width={dimensions.width}
             height={dimensions.height}
             backgroundColor="#0f0f13"
             nodeCanvasObject={paintNode}
             nodeCanvasObjectMode={() => "replace"}
-            linkColor={() => "#2a2a44"}
-            linkWidth={1}
+            linkCanvasObject={paintLink}
+            linkCanvasObjectMode={() => "replace"}
             linkDirectionalArrowLength={4}
-            linkDirectionalArrowRelPos={1}
-            nodeLabel={node => `${node.id} (${node.group})`}
+            linkDirectionalArrowRelPos={0.85}
+            linkDirectionalArrowColor={() => "#6c63ff55"}
+            nodeLabel={node => `${node.id} · ${GROUP_LABELS[node.group] || node.group}`}
             onNodeClick={handleNodeClick}
-            cooldownTicks={80}
+            onLinkHover={link => setHoveredLink(link)}
+            cooldownTicks={100}
             nodeRelSize={6}
+            d3AlphaDecay={0.02}
+            d3VelocityDecay={0.3}
+            onEngineStop={handleZoomFit}
           />
         )}
 
-        {/* Node detail panel */}
+        {/* ── Node detail panel ── */}
         {selectedNode && (
           <div className="graph-node-detail">
             <button
@@ -222,40 +334,83 @@ export default function KnowledgeGraph() {
             >
               <i className="ti ti-x" />
             </button>
-            <div className="node-detail-title">{selectedNode.id}</div>
-            <div className="node-detail-label">{selectedNode.group}</div>
+
+            <div
+              className="node-detail-title"
+              style={{ color: groupColor(selectedNode.group) }}
+            >
+              {selectedNode.id}
+            </div>
+            <div className="node-detail-label">
+              {GROUP_LABELS[selectedNode.group] || selectedNode.group}
+            </div>
+
             {nodeConnections.length > 0 && (
               <>
-                <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>
-                  CONNECTIONS
+                <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 8, letterSpacing: "0.6px", textTransform: "uppercase" }}>
+                  Relationships
                 </div>
                 {nodeConnections.map((l, i) => {
                   const src = typeof l.source === "object" ? l.source.id : l.source;
                   const tgt = typeof l.target === "object" ? l.target.id : l.target;
-                  const other = src === selectedNode.id ? tgt : src;
-                  const dir = src === selectedNode.id ? "→" : "←";
+                  const isOutgoing = src === selectedNode.id;
+                  const other = isOutgoing ? tgt : src;
                   return (
-                    <div key={i} style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 4, display: "flex", gap: 4 }}>
-                      <span style={{ color: "var(--text-muted)", fontFamily: "var(--font-mono)" }}>{dir}</span>
-                      <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--accent-light)" }}>{l.label}</span>
-                      <span>{other}</span>
+                    <div
+                      key={i}
+                      style={{
+                        fontSize: 12,
+                        color: "var(--text-secondary)",
+                        marginBottom: 6,
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 5,
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <span style={{ fontSize: 10, color: isOutgoing ? "var(--accent-light)" : "var(--teal)", fontFamily: "var(--font-mono)" }}>
+                        {isOutgoing ? "→" : "←"}
+                      </span>
+                      <span
+                        style={{
+                          fontFamily: "var(--font-mono)",
+                          fontSize: 10,
+                          color: "var(--text-muted)",
+                          background: "var(--bg-raised)",
+                          border: "1px solid var(--border)",
+                          borderRadius: 4,
+                          padding: "1px 5px",
+                        }}
+                      >
+                        {l.label}
+                      </span>
+                      <span style={{ fontSize: 12 }}>{truncate(other, 22)}</span>
                     </div>
                   );
                 })}
               </>
             )}
+
+            {nodeConnections.length === 0 && (
+              <div style={{ fontSize: 12, color: "var(--text-muted)", fontStyle: "italic" }}>
+                No relationships found
+              </div>
+            )}
           </div>
         )}
 
-        {/* Legend */}
+        {/* ── Legend ── */}
         {uniqueGroups.length > 0 && (
-          <div className="graph-legend">
+          <div className="graph-legend" style={{ flexWrap: "wrap", maxWidth: 420 }}>
             {uniqueGroups.map(g => (
               <div key={g} className="legend-item">
                 <div className="legend-dot" style={{ background: groupColor(g) }} />
-                {g}
+                {GROUP_LABELS[g] || g}
               </div>
             ))}
+            <div className="legend-item" style={{ marginLeft: "auto", color: "var(--text-muted)", fontSize: 10 }}>
+              Hover edges for labels
+            </div>
           </div>
         )}
       </div>
