@@ -7,7 +7,7 @@ def semantic_chunking(text, chunk_size=500):
 
     chunks = []
     current_chunk = ""
-
+    chunk["entities"] = []
     for paragraph in paragraphs:
 
         paragraph = paragraph.strip()

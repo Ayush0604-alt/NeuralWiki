@@ -1,6 +1,13 @@
 """
-Upload API Router — GraphRAG edition
+Upload API Router — GraphRAG edition (improved)
 --------------------------------------
+Changes vs original:
+  - After entity extraction, calls link_entities_to_chunks() to tag each
+    chunk with the canonical entities it contains (chunk-graph linking)
+  - The dedup_map from graph extraction is passed through to the linker
+    so entity names are consistent across chunks and graph nodes
+  - Chunks are re-embedded AFTER entity linking (entity tags stored in metadata)
+
 Endpoints:
   POST /upload              — upload + process (entity extraction → graph ingest → wiki)
   GET  /documents           — list indexed files + chunk counts
@@ -8,7 +15,7 @@ Endpoints:
   POST /clear-documents     — full reset
   GET  /search              — semantic vector search
   POST /chat                — GraphRAG hybrid chat (non-streaming, kept for backward compat)
-  POST /chat/stream         — GraphRAG hybrid chat with SSE token streaming  ← NEW
+  POST /chat/stream         — GraphRAG hybrid chat with SSE token streaming
   POST /clear-memory        — reset conversation memory
   GET  /knowledge-graph     — graph data for frontend visualisation
   GET  /graph/stats         — graph analytics
@@ -48,6 +55,7 @@ from app.services.knowledge_graph_service import (
     extract_entities_and_relationships,
     store_knowledge_graph,
     clear_knowledge_graph,
+    link_entities_to_chunks,          # NEW
 )
 from app.services.graph_rag_service import (
     ingest_document_graph,
@@ -79,28 +87,15 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md"}
 MAX_FILE_SIZE_MB = 50
 
-# Only allow safe filename characters (alphanumeric, dot, hyphen, underscore)
 _SAFE_FILENAME_RE = re.compile(r"[^\w.\-]")
 
-# ── Load persisted graph on module import ─────────────────────────────────────
 load_graph()
 
 
 def _sanitize_filename(raw: str) -> str:
-    """
-    Sanitize a filename to prevent path traversal and other injection attacks.
-    1. Strip any directory components.
-    2. Replace unsafe characters.
-    3. Collapse repeated underscores.
-    4. Ensure the result is non-empty.
-    """
-    # basename first to strip any path traversal attempt (e.g. ../../etc/passwd)
     name = os.path.basename(raw or "upload")
-    # Replace anything that isn't alphanumeric, dot, hyphen, or underscore
     name = _SAFE_FILENAME_RE.sub("_", name)
-    # Collapse repeated underscores/dots
     name = re.sub(r"_+", "_", name).strip("_")
-    # Guard against names that are nothing but dots (e.g. "....pdf" → ".pdf")
     parts = name.rsplit(".", 1)
     if len(parts) == 2 and not parts[0]:
         name = "upload." + parts[1]
@@ -109,7 +104,6 @@ def _sanitize_filename(raw: str) -> str:
 
 def _delete_upload_file(filename: str) -> bool:
     path = os.path.join(UPLOAD_DIR, filename)
-    # Extra guard: confirm resolved path is still inside UPLOAD_DIR
     resolved = os.path.realpath(path)
     if not resolved.startswith(os.path.realpath(UPLOAD_DIR)):
         logger.warning("Path traversal attempt blocked for '%s'", filename)
@@ -121,17 +115,11 @@ def _delete_upload_file(filename: str) -> bool:
 
 
 def _make_wiki_llm():
-    """Return a (query, context) → str callable using NVIDIA API for wiki gen."""
     from openai import OpenAI
-
     nvidia_key = os.getenv("NVIDIA_API_KEY")
     if not nvidia_key:
         raise RuntimeError("NVIDIA_API_KEY is not set — wiki generation unavailable")
-
-    client = OpenAI(
-        api_key=nvidia_key,
-        base_url="https://integrate.api.nvidia.com/v1",
-    )
+    client = OpenAI(api_key=nvidia_key, base_url="https://integrate.api.nvidia.com/v1")
     wiki_system = """You are NeuralWiki, an expert knowledge base curator.
 Generate a structured wiki page in Markdown with these sections:
 ## Overview, ## Key Concepts, ## Notable Entities, ## Key Facts & Findings,
@@ -152,8 +140,6 @@ Be concise, accurate, and only use information from the document."""
 
     return _llm
 
-
-# ── GraphRAG streaming context builder ───────────────────────────────────────
 
 _GRAPHRAG_ADDENDUM = """
 You also have access to a **Knowledge Graph context** section containing:
@@ -217,7 +203,6 @@ async def upload_file(file: UploadFile = File(...)):
         )
 
     file_path = os.path.join(UPLOAD_DIR, filename)
-    # Verify resolved path stays inside UPLOAD_DIR
     if not os.path.realpath(file_path).startswith(os.path.realpath(UPLOAD_DIR)):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
@@ -229,18 +214,32 @@ async def upload_file(file: UploadFile = File(...)):
         if not extracted_text or not extracted_text.strip():
             raise ValueError("Document appears to be empty or could not be parsed.")
 
-        # ── 1. Vector store ──────────────────────────────────────────────────
+        # ── 1. Chunk ─────────────────────────────────────────────────────────
         chunks = semantic_chunking(extracted_text)
-        embedded_chunks = generate_embeddings(chunks)
-        store_embeddings(filename, embedded_chunks)
 
         # ── 2. Entity + relationship extraction ─────────────────────────────
         graph_data = extract_entities_and_relationships(extracted_text)
 
-        # ── 3a. Legacy in-memory store ───────────────────────────────────────
+        # ── 3. Chunk-to-entity linking (NEW) ─────────────────────────────────
+        # Tag each chunk with the canonical entities it contains.
+        # Uses the dedup_map from graph extraction so entity names are consistent.
+        dedup_map = graph_data.pop("_dedup_map", {})
+        chunks = link_entities_to_chunks(
+            chunks,
+            graph_data["entities"],
+            dedup_map=dedup_map,
+        )
+
+        # ── 4. Embed (AFTER linking so entity tags are on the chunk dicts) ───
+        embedded_chunks = generate_embeddings(chunks)
+
+        # ── 5. Vector store ──────────────────────────────────────────────────
+        store_embeddings(filename, embedded_chunks)
+
+        # ── 6a. Legacy in-memory store ───────────────────────────────────────
         store_knowledge_graph(graph_data)
 
-        # ── 3b. GraphRAG: ingest into persistent NetworkX graph ─────────────
+        # ── 6b. GraphRAG: ingest into persistent NetworkX graph ─────────────
         ingest_document_graph(
             doc_id=filename,
             center=graph_data.get("center", {}),
@@ -249,7 +248,7 @@ async def upload_file(file: UploadFile = File(...)):
             doc_type=graph_data.get("doc_type", "general"),
         )
 
-        # ── 4. Wiki generation ───────────────────────────────────────────────
+        # ── 7. Wiki generation ───────────────────────────────────────────────
         wiki_generated = False
         try:
             generate_wiki_page(filename, extracted_text, _make_wiki_llm())
@@ -257,24 +256,32 @@ async def upload_file(file: UploadFile = File(...)):
         except Exception as wiki_err:
             logger.warning("Wiki generation skipped for '%s': %s", filename, wiki_err)
 
+        # Count total entity-chunk links for the response
+        total_links = sum(len(c.get("entities", [])) for c in embedded_chunks)
+
         logger.info(
-            "Uploaded '%s': %d chunks, %d entities, %d relationships, wiki=%s",
+            "Uploaded '%s': %d chunks, %d entities, %d relationships, "
+            "%d entity-chunk links, %d dedup merges, wiki=%s",
             filename,
             len(embedded_chunks),
             len(graph_data["entities"]),
             len(graph_data["relationships"]),
+            total_links,
+            len(dedup_map),
             wiki_generated,
         )
 
         return {
-            "success": True,
-            "filename": filename,
-            "file_size_kb": round(len(content) / 1024, 1),
-            "chunks_stored": len(embedded_chunks),
-            "entities_found": len(graph_data["entities"]),
-            "relationships_found": len(graph_data["relationships"]),
-            "wiki_generated": wiki_generated,
-            "message": "Document processed successfully",
+            "success":              True,
+            "filename":             filename,
+            "file_size_kb":         round(len(content) / 1024, 1),
+            "chunks_stored":        len(embedded_chunks),
+            "entities_found":       len(graph_data["entities"]),
+            "relationships_found":  len(graph_data["relationships"]),
+            "entity_chunk_links":   total_links,       # NEW
+            "entity_dedup_merges":  len(dedup_map),    # NEW
+            "wiki_generated":       wiki_generated,
+            "message":              "Document processed successfully",
         }
 
     except Exception:
@@ -326,9 +333,7 @@ async def delete_one_document(body: dict):
 
 @router.post("/clear-documents")
 async def clear_all():
-    """Full reset — vector store, files, graph, memory, wiki."""
     chunks_deleted = clear_all_documents()
-
     files_deleted = 0
     for path in glob.glob(os.path.join(UPLOAD_DIR, "*")):
         if os.path.isfile(path):
@@ -351,7 +356,6 @@ async def clear_all():
         "chunks_deleted": chunks_deleted,
         "files_deleted": files_deleted,
         "wiki_pages_cleared": wiki_cleared,
-        # Signal to the frontend that memory was also cleared
         "memory_cleared": True,
         "message": "Knowledge base cleared. System is ready for new documents.",
     }
@@ -369,7 +373,7 @@ async def search(query: str):
     return {"success": True, "query": q, "total_results": len(results), "results": results}
 
 
-# ── Chat — GraphRAG hybrid (non-streaming, backward compat) ──────────────────
+# ── Chat — GraphRAG hybrid (non-streaming) ────────────────────────────────────
 
 @router.post("/chat")
 async def chat(request: dict):
@@ -379,7 +383,7 @@ async def chat(request: dict):
 
     add_message("User", query)
     history = get_conversation_history()
-    retrieval = hybrid_retrieve(query, top_k=5, similarity_threshold=1.5)
+    retrieval = hybrid_retrieve(query, top_k=5)
 
     if retrieval["retrieval_mode"] == "none":
         response_text = (
@@ -416,44 +420,24 @@ async def chat(request: dict):
     }
 
 
-# ── Chat — SSE streaming  ─────────────────────────────────────────────────────
+# ── Chat — SSE streaming ──────────────────────────────────────────────────────
 
 @router.post("/chat/stream")
 async def chat_stream(request: dict):
-    """
-    Server-Sent Events streaming chat.
-
-    Yields newline-delimited SSE frames:
-      data: {"type": "token",  "content": "<text fragment>"}
-      data: {"type": "meta",   "retrieval_mode": "...", "seed_entities": [...],
-                               "sources": [...], "subgraph": {...}}
-      data: {"type": "done"}
-      data: {"type": "error",  "content": "<message>"}
-
-    The `subgraph` field in the meta frame contains the nodes/edges used
-    during retrieval so the frontend can render a "reasoning subgraph".
-    """
     query = (request.get("query") or "").strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query is required")
 
     add_message("User", query)
     history = get_conversation_history()
-    retrieval = hybrid_retrieve(query, top_k=5, similarity_threshold=1.5)
+    retrieval = hybrid_retrieve(query, top_k=5)
 
-    # Build reasoning subgraph payload for the frontend
     def _build_subgraph(seed_entities: list[str]) -> dict:
-        """
-        Return a small {nodes, links} structure covering only the nodes/edges
-        that were traversed to answer this query (up to 2 hops from seeds).
-        """
         nodes_map: dict[str, dict] = {}
         links: list[dict] = []
         seen_links: set[tuple] = set()
-
         for seed in seed_entities[:5]:
             neighbors = get_neighbors(seed, max_hops=2, max_nodes=30)
-            # Seed itself
             nodes_map[seed] = {"id": seed, "isSeed": True}
             for nbr in neighbors:
                 nid = nbr["node"]
@@ -468,7 +452,6 @@ async def chat_stream(request: dict):
                             "target": path[-1],
                             "label": nbr["via"][0] if nbr["via"] else "→",
                         })
-
         return {"nodes": list(nodes_map.values()), "links": links}
 
     async def event_stream():
@@ -515,7 +498,6 @@ async def chat_stream(request: dict):
             add_message("AI", full_response)
 
             subgraph = _build_subgraph(retrieval["seed_entities"]) if retrieval["seed_entities"] else {"nodes": [], "links": []}
-
             yield f"data: {json.dumps({'type': 'meta', 'retrieval_mode': retrieval['retrieval_mode'], 'seed_entities': retrieval['seed_entities'], 'sources': format_sources(retrieval['vector_chunks']), 'subgraph': subgraph})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
@@ -542,7 +524,7 @@ async def reset_memory():
     return {"success": True, "message": "Conversation memory cleared"}
 
 
-# ── Knowledge graph — legacy endpoint (for KnowledgeGraph.jsx) ───────────────
+# ── Knowledge graph ───────────────────────────────────────────────────────────
 
 @router.get("/knowledge-graph")
 async def knowledge_graph():
@@ -553,8 +535,6 @@ async def knowledge_graph():
     return {"success": True, "graph": legacy_get()}
 
 
-# ── Graph analytics ───────────────────────────────────────────────────────────
-
 @router.get("/graph/stats")
 async def graph_stats():
     return {"success": True, "stats": get_graph_stats()}
@@ -564,7 +544,6 @@ async def graph_stats():
 async def graph_query(body: dict):
     entities = body.get("entities") or []
     hops = min(int(body.get("hops", 2)), 4)
-
     if not entities:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="entities list is required")
 
@@ -626,7 +605,6 @@ async def regenerate_wiki(body: dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="filename is required")
 
     file_path = os.path.join(UPLOAD_DIR, filename)
-    # Path traversal guard
     if not os.path.realpath(file_path).startswith(os.path.realpath(UPLOAD_DIR)):
         raise HTTPException(status_code=400, detail="Invalid filename")
     if not os.path.exists(file_path):

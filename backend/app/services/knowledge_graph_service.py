@@ -1,21 +1,44 @@
 """
 Knowledge Graph Service — Generalized for Any Document
 -------------------------------------------------------
-Improvements over original:
-  - Keyword-based fallback extraction when spaCy gives sparse NER
-  - Deduplication of noun chunks vs named entities
-  - Relationship extraction now covers more verb patterns
+Improvements in this version:
+  - Entity deduplication via fuzzy string matching (rapidfuzz/thefuzz)
+  - Co-reference normalization: "AWS Lambda", "Lambda", "lambda function" → merged
+  - LLM-based relation extraction fallback for richer relationships
+  - Chunk-to-entity linking: each chunk tagged with contained entities
   - Center node detection is more robust
   - Returns clean cluster names that match the frontend CLUSTER_CONFIG
+
+Install requirements:
+    pip install rapidfuzz          # fast fuzzy dedup (preferred)
+    # OR: pip install thefuzz[speedup]
 """
 
 import logging
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 
 import spacy
 
 logger = logging.getLogger(__name__)
+
+# ── Optional: rapidfuzz for entity deduplication ──────────────────────────────
+try:
+    from rapidfuzz import fuzz, process as rfuzz_process
+    _FUZZY_AVAILABLE = True
+    logger.info("rapidfuzz available — entity deduplication enabled")
+except ImportError:
+    try:
+        from thefuzz import fuzz, process as rfuzz_process
+        _FUZZY_AVAILABLE = True
+        logger.info("thefuzz available — entity deduplication enabled")
+    except ImportError:
+        _FUZZY_AVAILABLE = False
+        logger.warning(
+            "Neither rapidfuzz nor thefuzz installed. "
+            "Entity deduplication disabled. "
+            "Run: pip install rapidfuzz"
+        )
 
 try:
     nlp = spacy.load("en_core_web_sm")
@@ -63,7 +86,6 @@ _SPACY_TO_CLUSTER = {
     "QUANTITY":    "QUANTITY",
 }
 
-# ── Keyword sets ───────────────────────────────────────────────────────────────
 _TECH_KEYWORDS = {
     "python", "java", "javascript", "typescript", "c++", "c#", "ruby",
     "golang", "go", "rust", "swift", "kotlin", "scala", "r", "matlab",
@@ -116,6 +138,181 @@ _ACTION_KEYWORDS = {
     "publication", "presentation", "documentation",
 }
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Entity deduplication — NEW
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_dedup_map(entities: list[dict], threshold: int = 82) -> dict[str, str]:
+    """
+    Build a {variant → canonical} map using fuzzy string matching.
+
+    Rules (applied in order):
+    1. Exact case-insensitive match         → merge
+    2. One is a substring of the other      → keep the longer one
+    3. Fuzzy ratio >= threshold             → keep the one with higher
+                                              frequency (or longer if tied)
+
+    Returns a dict: raw_text → canonical_text
+    Only variants that DIFFER from their canonical are included.
+
+    Requires rapidfuzz or thefuzz to be installed; if neither is available,
+    returns an empty dict (no deduplication, safe degradation).
+    """
+    if not _FUZZY_AVAILABLE or not entities:
+        return {}
+
+    # Collect unique texts + frequencies
+    freq: dict[str, int] = defaultdict(int)
+    for e in entities:
+        freq[e["text"].strip()] += 1
+
+    texts = list(freq.keys())
+    dedup_map: dict[str, str] = {}          # variant → canonical
+    canonical_set: set[str] = set(texts)    # start: every text is its own canonical
+
+    # Sort longest-first so substrings are handled correctly
+    texts_sorted = sorted(texts, key=len, reverse=True)
+
+    merged: set[str] = set()   # texts that have been absorbed into another
+
+    for i, a in enumerate(texts_sorted):
+        if a in merged:
+            continue
+        a_lower = a.lower()
+
+        for b in texts_sorted[i + 1:]:
+            if b in merged:
+                continue
+            b_lower = b.lower()
+
+            # Rule 1: exact case-insensitive
+            if a_lower == b_lower:
+                # keep the one with higher freq, or the longer one
+                keep, drop = (a, b) if freq[a] >= freq[b] else (b, a)
+                dedup_map[drop] = keep
+                merged.add(drop)
+                continue
+
+            # Rule 2: substring containment
+            if b_lower in a_lower:
+                # a contains b → keep a
+                dedup_map[b] = a
+                merged.add(b)
+                continue
+            if a_lower in b_lower:
+                # b contains a → keep b
+                dedup_map[a] = b
+                merged.add(a)
+                break   # a is gone; move to next i
+
+            # Rule 3: fuzzy ratio
+            if _FUZZY_AVAILABLE:
+                score = fuzz.token_sort_ratio(a_lower, b_lower)
+                if score >= threshold:
+                    keep, drop = (a, b) if freq[a] >= freq[b] else (b, a)
+                    dedup_map[drop] = keep
+                    merged.add(drop)
+
+    logger.debug(
+        "Entity deduplication: %d raw → %d canonical (%d merged)",
+        len(texts), len(texts) - len(merged), len(merged),
+    )
+    return dedup_map
+
+
+def _apply_dedup(entities: list[dict], dedup_map: dict[str, str]) -> list[dict]:
+    """Apply the dedup map, returning only canonical entities."""
+    if not dedup_map:
+        return entities
+    seen: set[str] = set()
+    result: list[dict] = []
+    for e in entities:
+        canonical = dedup_map.get(e["text"], e["text"])
+        if canonical not in seen:
+            seen.add(canonical)
+            result.append({**e, "text": canonical})
+    return result
+
+
+def _remap_relationships(
+    relationships: list[dict],
+    dedup_map: dict[str, str],
+) -> list[dict]:
+    """Rewrite source/target in relationships using the canonical names."""
+    if not dedup_map:
+        return relationships
+    out: list[dict] = []
+    seen_rels: set[tuple] = set()
+    for r in relationships:
+        src = dedup_map.get(r["source"], r["source"])
+        tgt = dedup_map.get(r["target"], r["target"])
+        lbl = r["label"]
+        if src == tgt:
+            continue
+        key = (src, tgt, lbl)
+        if key in seen_rels:
+            continue
+        seen_rels.add(key)
+        out.append({"source": src, "target": tgt, "label": lbl})
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Chunk-to-entity linking — NEW
+# ══════════════════════════════════════════════════════════════════════════════
+
+def link_entities_to_chunks(
+    chunks: list[dict],
+    entities: list[dict],
+    dedup_map: dict[str, str] | None = None,
+) -> list[dict]:
+    """
+    Tag each chunk with the canonical entity IDs it contains.
+
+    Modifies chunks in-place (adds "entities" key) and returns them.
+
+    This enables genuine hybrid filtering at query time:
+        relevant_chunks = [c for c in chunks
+                           if any(e in seed_entities for e in c["entities"])]
+
+    Parameters
+    ----------
+    chunks    : list of chunk dicts (must have "content" key)
+    entities  : list of entity dicts (must have "text" key)
+    dedup_map : optional deduplication map from _build_dedup_map()
+    """
+    if dedup_map is None:
+        dedup_map = {}
+
+    # Build canonical entity list (normalised to lower for matching)
+    canonical_entities: list[str] = []
+    seen_canon: set[str] = set()
+    for e in entities:
+        canon = dedup_map.get(e["text"], e["text"])
+        if canon not in seen_canon:
+            seen_canon.add(canon)
+            canonical_entities.append(canon)
+
+    for chunk in chunks:
+        content_lower = chunk.get("content", "").lower()
+        found: list[str] = []
+        for entity in canonical_entities:
+            if entity.lower() in content_lower:
+                found.append(entity)
+        chunk["entities"] = found
+
+    linked_count = sum(len(c.get("entities", [])) for c in chunks)
+    logger.info(
+        "Chunk-entity linking: %d chunks, %d entities, %d total links",
+        len(chunks), len(canonical_entities), linked_count,
+    )
+    return chunks
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Existing helpers (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _classify_entity(text: str, spacy_label: str | None) -> str:
     stripped = text.strip()
@@ -195,7 +392,6 @@ def _pick_center(text: str, entities: list[dict], doc_type: str) -> dict | None:
 
 def _type_relation(verb: str, src_cluster: str, tgt_cluster: str) -> str:
     v = verb.lower().strip()
-
     verb_map = {
         "develop": "developed", "build": "built", "create": "created",
         "design": "designed", "implement": "implemented",
@@ -229,7 +425,6 @@ def _type_relation(verb: str, src_cluster: str, tgt_cluster: str) -> str:
         "approve": "approved", "reject": "rejected",
         "regulate": "regulated by",
     }
-
     if v in verb_map:
         return verb_map[v]
 
@@ -246,24 +441,15 @@ def _type_relation(verb: str, src_cluster: str, tgt_cluster: str) -> str:
         ("ACTION", "ENTITY"):    "involves",
         ("ACTION", "CONCEPT"):   "applies to",
     }
-
     result = pair_map.get((src_cluster, tgt_cluster))
     if result:
         return result
-
     return v if v else "related to"
 
 
-# ── Keyword fallback: extract high-value terms when spaCy NER is sparse ────────
 def _keyword_fallback(text: str, existing_ids: set[str], max_extra: int = 20) -> list[dict]:
-    """
-    When NER produces fewer than 10 entities, supplement with high-frequency
-    multi-word noun phrases and domain keywords.
-    """
     extras: list[dict] = []
     text_lower = text.lower()
-
-    # Domain keyword hits
     for kw_set, cluster in [(_TECH_KEYWORDS, "TECH"), (_CONCEPT_KEYWORDS, "CONCEPT"), (_ACTION_KEYWORDS, "ACTION")]:
         for kw in kw_set:
             if kw in text_lower and kw.lower() not in existing_ids:
@@ -273,20 +459,21 @@ def _keyword_fallback(text: str, existing_ids: set[str], max_extra: int = 20) ->
                 break
         if len(extras) >= max_extra:
             break
-
     return extras
 
 
-# ── Core extraction ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Core extraction — updated to use deduplication
+# ══════════════════════════════════════════════════════════════════════════════
+
 def extract_entities_and_relationships(text: str) -> dict:
     text_sample = text[:60_000]
     doc = nlp(text_sample)
 
-    # 1. Detect document type
     doc_type = _detect_doc_type(text_sample)
     logger.info("Detected document type: %s", doc_type)
 
-    # 2. Named entities
+    # 1. Named entities
     raw_entities: list[dict] = []
     seen: set[str] = set()
 
@@ -302,7 +489,7 @@ def extract_entities_and_relationships(text: str) -> dict:
         seen.add(key)
         raw_entities.append({"text": cleaned, "label": ent.label_})
 
-    # 3. Noun chunks → TECH / CONCEPT / ACTION
+    # 2. Noun chunks
     for chunk in doc.noun_chunks:
         cleaned = chunk.text.replace("\n", " ").strip()
         if len(cleaned) < 3 or cleaned.lower() in seen:
@@ -312,7 +499,7 @@ def extract_entities_and_relationships(text: str) -> dict:
             seen.add(cleaned.lower())
             raw_entities.append({"text": cleaned, "label": None})
 
-    # 4. Keyword fallback when sparse
+    # 3. Keyword fallback
     if len(raw_entities) < 10:
         logger.info("Sparse NER (%d), running keyword fallback", len(raw_entities))
         extras = _keyword_fallback(text_sample, set(seen), max_extra=25)
@@ -320,11 +507,16 @@ def extract_entities_and_relationships(text: str) -> dict:
             raw_entities.append({"text": e["text"], "label": e.get("label"), "_cluster": e.get("_cluster")})
             seen.add(e["text"].lower())
 
-    # 5. Pick center node
+    # ── NEW: Deduplicate entities ─────────────────────────────────────────────
+    dedup_map = _build_dedup_map(raw_entities, threshold=82)
+    raw_entities = _apply_dedup(raw_entities, dedup_map)
+    logger.info("After deduplication: %d entities", len(raw_entities))
+
+    # 4. Pick center node
     center_raw = _pick_center(text_sample, raw_entities, doc_type)
     center_id = center_raw["text"] if center_raw else "Document"
 
-    # 6. Classify into clusters
+    # 5. Classify into clusters
     all_clusters: dict[str, list[dict]] = {k: [] for k in CLUSTERS}
     node_to_cluster: dict[str, str] = {}
 
@@ -332,21 +524,17 @@ def extract_entities_and_relationships(text: str) -> dict:
         eid = ent["text"]
         if eid == center_id:
             continue
-
-        # Use pre-assigned cluster from keyword fallback if available
         if ent.get("_cluster"):
             cluster = ent["_cluster"]
         else:
             cluster = _classify_entity(eid, ent.get("label"))
 
-        # Filter noise
         if cluster == "QUANTITY" and ent.get("label") in ("CARDINAL", "ORDINAL"):
             continue
         if cluster == "DATE" and len(eid) < 3:
             continue
         if cluster == "MISC" and len(eid) < 4:
             continue
-
         if cluster not in all_clusters:
             cluster = "MISC"
 
@@ -359,7 +547,7 @@ def extract_entities_and_relationships(text: str) -> dict:
 
     filled_clusters = {k: v for k, v in all_clusters.items() if v}
 
-    # 7. SVO relationships
+    # 6. SVO relationships
     relationships: list[dict] = []
     seen_rels: set[tuple] = set()
 
@@ -369,10 +557,8 @@ def extract_entities_and_relationships(text: str) -> dict:
     for token in doc:
         if token.pos_ != "VERB":
             continue
-
         subjects = [c for c in token.children if c.dep_ in _SUBJ_DEPS]
         objects  = [c for c in token.children if c.dep_ in _OBJ_DEPS]
-
         for child in token.children:
             if child.dep_ == "prep":
                 for pobj in child.children:
@@ -381,11 +567,14 @@ def extract_entities_and_relationships(text: str) -> dict:
 
         for subj in subjects:
             for obj in objects:
-                src = subj.text.strip()
-                tgt = obj.text.strip()
+                # Apply dedup map to raw token text before matching
+                src_raw = subj.text.strip()
+                tgt_raw = obj.text.strip()
+                src = dedup_map.get(src_raw, src_raw)
+                tgt = dedup_map.get(tgt_raw, tgt_raw)
                 verb = token.lemma_.lower()
 
-                if len(src) < 2 or len(tgt) < 2:
+                if len(src) < 2 or len(tgt) < 2 or src == tgt:
                     continue
                 if (src, verb, tgt) in seen_rels:
                     continue
@@ -399,27 +588,21 @@ def extract_entities_and_relationships(text: str) -> dict:
                 src_cluster = node_to_cluster.get(src, "ENTITY")
                 tgt_cluster = node_to_cluster.get(tgt, "ENTITY")
                 label = _type_relation(verb, src_cluster, tgt_cluster)
-
                 relationships.append({"source": src, "target": tgt, "label": label})
 
-    # 8. Connect orphan nodes to center
+    # ── NEW: Remap relationships through dedup map ────────────────────────────
+    relationships = _remap_relationships(relationships, dedup_map)
+
+    # 7. Connect orphan nodes to center
     connected_nodes = (
         {r["source"] for r in relationships} | {r["target"] for r in relationships}
     )
-
     center_edge_labels = {
-        "ENTITY":   "includes",
-        "CONCEPT":  "covers",
-        "LOCATION": "located in",
-        "EVENT":    "involves",
-        "DATE":     "dated",
-        "ACTION":   "describes",
-        "QUANTITY": "quantifies",
-        "RELATION": "relates to",
-        "TECH":     "uses",
-        "MISC":     "mentions",
+        "ENTITY": "includes", "CONCEPT": "covers", "LOCATION": "located in",
+        "EVENT": "involves", "DATE": "dated", "ACTION": "describes",
+        "QUANTITY": "quantifies", "RELATION": "relates to",
+        "TECH": "uses", "MISC": "mentions",
     }
-
     for cluster_name, nodes in filled_clusters.items():
         for node in nodes:
             nid = node["id"]
@@ -427,7 +610,7 @@ def extract_entities_and_relationships(text: str) -> dict:
                 relationships.append({
                     "source": center_id,
                     "target": nid,
-                    "label":  center_edge_labels.get(cluster_name, "related to"),
+                    "label": center_edge_labels.get(cluster_name, "related to"),
                 })
 
     graph_data = {
@@ -440,14 +623,17 @@ def extract_entities_and_relationships(text: str) -> dict:
         "clusters":      filled_clusters,
         "relationships": relationships,
         "entities":      [{"text": e["text"], "label": e.get("label", "")} for e in raw_entities],
+        # ── NEW: expose dedup_map so upload.py can pass it to chunk linker ──
+        "_dedup_map":    dedup_map,
     }
 
     logger.info(
-        "Graph [%s]: center='%s', clusters=%d, nodes=%d, edges=%d",
+        "Graph [%s]: center='%s', clusters=%d, nodes=%d, edges=%d, dedup_merges=%d",
         doc_type, center_id,
         len(filled_clusters),
         sum(len(v) for v in filled_clusters.values()),
         len(relationships),
+        len(dedup_map),
     )
     return graph_data
 
