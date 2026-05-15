@@ -6,7 +6,7 @@ Combines:
   2. Graph neighbourhood BFS   (NetworkX GraphRAG)
   3. Entity-centric re-ranking
 
-This is the single entry-point called by the /chat endpoint.
+Single entry-point called by the /chat endpoint.
 """
 
 import logging
@@ -62,7 +62,7 @@ def hybrid_retrieve(
     elif has_vector:
         retrieval_mode = "vector_only"
         enriched_context = "\n\n".join(
-            f"[Chunk {i+1} | Source: {c['source']}]\n{c['content']}"
+            f"[Chunk {i + 1} | Source: {c['source']}]\n{c['content']}"
             for i, c in enumerate(vector_chunks)
         )
     elif has_graph:
@@ -73,7 +73,7 @@ def hybrid_retrieve(
         enriched_context = ""
 
     logger.info(
-        "HybridRetrieve: mode=%s vector_chunks=%d seed_entities=%d",
+        "HybridRetrieve: mode=%s  vector_chunks=%d  seed_entities=%d",
         retrieval_mode, len(vector_chunks), len(seed_entities),
     )
 
