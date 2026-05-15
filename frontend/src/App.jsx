@@ -3,13 +3,15 @@ import Upload from "./pages/Upload";
 import SearchBox from "./components/SearchBox";
 import ChatBox from "./components/ChatBox";
 import KnowledgeGraph from "./components/KnowledgeGraph";
+import Wiki from "./components/Wiki";
 import "./App.css";
 
 const NAV = [
-  { id: "chat", icon: "ti-message-2", label: "Chat" },
-  { id: "search", icon: "ti-search", label: "Search" },
-  { id: "graph", icon: "ti-share-2", label: "Graph" },
-  { id: "upload", icon: "ti-cloud-upload", label: "Upload" },
+  { id: "chat",   icon: "ti-message-2",   label: "Chat" },
+  { id: "wiki",   icon: "ti-book",        label: "Wiki" },
+  { id: "search", icon: "ti-search",      label: "Search" },
+  { id: "graph",  icon: "ti-share-2",     label: "Graph" },
+  { id: "upload", icon: "ti-cloud-upload",label: "Upload" },
 ];
 
 export default function App() {
@@ -54,18 +56,11 @@ export default function App() {
       </header>
 
       <main className="main-content">
-        <div className={`tab-panel${activeTab === "chat" ? " active" : ""}`}>
-          <ChatBox />
-        </div>
-        <div className={`tab-panel${activeTab === "search" ? " active" : ""}`}>
-          <SearchBox />
-        </div>
-        <div className={`tab-panel${activeTab === "graph" ? " active" : ""}`}>
-          <KnowledgeGraph />
-        </div>
-        <div className={`tab-panel${activeTab === "upload" ? " active" : ""}`}>
-          <Upload />
-        </div>
+        <div className={`tab-panel${activeTab === "chat"   ? " active" : ""}`}><ChatBox /></div>
+        <div className={`tab-panel${activeTab === "wiki"   ? " active" : ""}`}><Wiki /></div>
+        <div className={`tab-panel${activeTab === "search" ? " active" : ""}`}><SearchBox /></div>
+        <div className={`tab-panel${activeTab === "graph"  ? " active" : ""}`}><KnowledgeGraph /></div>
+        <div className={`tab-panel${activeTab === "upload" ? " active" : ""}`}><Upload /></div>
       </main>
     </div>
   );
