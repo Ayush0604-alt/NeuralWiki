@@ -7,7 +7,8 @@ Endpoints:
   POST /delete-document     — remove one file (vector + graph + wiki)
   POST /clear-documents     — full reset
   GET  /search              — semantic vector search
-  POST /chat                — GraphRAG hybrid chat (vector + graph traversal)
+  POST /chat                — GraphRAG hybrid chat (non-streaming, kept for backward compat)
+  POST /chat/stream         — GraphRAG hybrid chat with SSE token streaming  ← NEW
   POST /clear-memory        — reset conversation memory
   GET  /knowledge-graph     — graph data for frontend visualisation
   GET  /graph/stats         — graph analytics
@@ -20,9 +21,11 @@ Endpoints:
 """
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, status
+from fastapi.responses import StreamingResponse
 
 import os
 import re
+import json
 import logging
 import glob
 
@@ -37,12 +40,12 @@ from app.services.vector_service import (
     clear_all_documents,
 )
 from app.services.llm.llm_manager import generate_ai_response, generate_graphrag_response
+from app.services.llm.nvidia_provider import NVIDIA_API_KEY, SYSTEM_PROMPT as NVIDIA_SYSTEM_PROMPT
 from app.services.memory_service import add_message, get_conversation_history, clear_memory
 
 # ── GraphRAG imports ───────────────────────────────────────────────────────────
 from app.services.knowledge_graph_service import (
     extract_entities_and_relationships,
-    # legacy in-memory store (kept for backward compat with /knowledge-graph endpoint)
     store_knowledge_graph,
     clear_knowledge_graph,
 )
@@ -75,6 +78,8 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md"}
 MAX_FILE_SIZE_MB = 50
+
+# Only allow safe filename characters (alphanumeric, dot, hyphen, underscore)
 _SAFE_FILENAME_RE = re.compile(r"[^\w.\-]")
 
 # ── Load persisted graph on module import ─────────────────────────────────────
@@ -82,27 +87,49 @@ load_graph()
 
 
 def _sanitize_filename(raw: str) -> str:
+    """
+    Sanitize a filename to prevent path traversal and other injection attacks.
+    1. Strip any directory components.
+    2. Replace unsafe characters.
+    3. Collapse repeated underscores.
+    4. Ensure the result is non-empty.
+    """
+    # basename first to strip any path traversal attempt (e.g. ../../etc/passwd)
     name = os.path.basename(raw or "upload")
+    # Replace anything that isn't alphanumeric, dot, hyphen, or underscore
     name = _SAFE_FILENAME_RE.sub("_", name)
+    # Collapse repeated underscores/dots
     name = re.sub(r"_+", "_", name).strip("_")
+    # Guard against names that are nothing but dots (e.g. "....pdf" → ".pdf")
+    parts = name.rsplit(".", 1)
+    if len(parts) == 2 and not parts[0]:
+        name = "upload." + parts[1]
     return name or "upload"
 
 
 def _delete_upload_file(filename: str) -> bool:
     path = os.path.join(UPLOAD_DIR, filename)
-    if os.path.exists(path):
-        os.remove(path)
+    # Extra guard: confirm resolved path is still inside UPLOAD_DIR
+    resolved = os.path.realpath(path)
+    if not resolved.startswith(os.path.realpath(UPLOAD_DIR)):
+        logger.warning("Path traversal attempt blocked for '%s'", filename)
+        return False
+    if os.path.exists(resolved):
+        os.remove(resolved)
         return True
     return False
 
 
 def _make_wiki_llm():
     """Return a (query, context) → str callable using NVIDIA API for wiki gen."""
-    import os as _os
     from openai import OpenAI
 
+    nvidia_key = os.getenv("NVIDIA_API_KEY")
+    if not nvidia_key:
+        raise RuntimeError("NVIDIA_API_KEY is not set — wiki generation unavailable")
+
     client = OpenAI(
-        api_key=_os.getenv("NVIDIA_API_KEY"),
+        api_key=nvidia_key,
         base_url="https://integrate.api.nvidia.com/v1",
     )
     wiki_system = """You are NeuralWiki, an expert knowledge base curator.
@@ -124,6 +151,47 @@ Be concise, accurate, and only use information from the document."""
         return completion.choices[0].message.content
 
     return _llm
+
+
+# ── GraphRAG streaming context builder ───────────────────────────────────────
+
+_GRAPHRAG_ADDENDUM = """
+You also have access to a **Knowledge Graph context** section containing:
+- Entity relationships as triples:  `Entity A → [relationship] → Entity B`
+- Multi-hop reasoning paths connecting entities across documents
+- Key entity metadata (type, frequency)
+
+**How to use the Knowledge Graph:**
+- Use triples to reason about HOW entities relate to each other
+- Follow multi-hop paths to answer questions that require chaining facts
+  (e.g. if A → [uses] → B and B → [integrates_with] → C, then A indirectly relates to C)
+- Cite graph relationships when they directly support your answer
+- If graph triples and text chunks conflict, prefer the text chunks
+"""
+
+
+def _build_graphrag_context(query: str, retrieval: dict, history: str) -> str:
+    seed_str = ""
+    if retrieval["seed_entities"]:
+        seed_str = f"\n**Detected query entities:** {', '.join(retrieval['seed_entities'][:5])}\n"
+
+    mode_note = {
+        "hybrid":      "Using hybrid retrieval (vector search + knowledge graph traversal).",
+        "graph_only":  "Using knowledge graph only — no matching text chunks found.",
+        "vector_only": "Using vector search only — no graph entities matched the query.",
+        "none":        "No relevant information found in the knowledge base.",
+    }.get(retrieval["retrieval_mode"], "")
+
+    return f"""Conversation History:
+{history}
+
+[Retrieval Mode: {retrieval['retrieval_mode'].upper()}] {mode_note}
+{seed_str}
+{_GRAPHRAG_ADDENDUM}
+
+Retrieved Knowledge (Vector Chunks + Knowledge Graph Triples):
+{retrieval['enriched_context']}
+"""
 
 
 # ── Upload ────────────────────────────────────────────────────────────────────
@@ -149,6 +217,10 @@ async def upload_file(file: UploadFile = File(...)):
         )
 
     file_path = os.path.join(UPLOAD_DIR, filename)
+    # Verify resolved path stays inside UPLOAD_DIR
+    if not os.path.realpath(file_path).startswith(os.path.realpath(UPLOAD_DIR)):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
     with open(file_path, "wb") as f:
         f.write(content)
 
@@ -165,7 +237,7 @@ async def upload_file(file: UploadFile = File(...)):
         # ── 2. Entity + relationship extraction ─────────────────────────────
         graph_data = extract_entities_and_relationships(extracted_text)
 
-        # ── 3a. Legacy in-memory store (keeps /knowledge-graph working) ─────
+        # ── 3a. Legacy in-memory store ───────────────────────────────────────
         store_knowledge_graph(graph_data)
 
         # ── 3b. GraphRAG: ingest into persistent NetworkX graph ─────────────
@@ -266,8 +338,8 @@ async def clear_all():
             except OSError as exc:
                 logger.warning("Could not delete %s: %s", path, exc)
 
-    clear_knowledge_graph()   # legacy list
-    graph_clear()             # NetworkX graph
+    clear_knowledge_graph()
+    graph_clear()
     clear_memory()
     wiki_cleared = clear_wiki_pages()
 
@@ -279,6 +351,8 @@ async def clear_all():
         "chunks_deleted": chunks_deleted,
         "files_deleted": files_deleted,
         "wiki_pages_cleared": wiki_cleared,
+        # Signal to the frontend that memory was also cleared
+        "memory_cleared": True,
         "message": "Knowledge base cleared. System is ready for new documents.",
     }
 
@@ -295,7 +369,7 @@ async def search(query: str):
     return {"success": True, "query": q, "total_results": len(results), "results": results}
 
 
-# ── Chat — GraphRAG hybrid ────────────────────────────────────────────────────
+# ── Chat — GraphRAG hybrid (non-streaming, backward compat) ──────────────────
 
 @router.post("/chat")
 async def chat(request: dict):
@@ -305,8 +379,6 @@ async def chat(request: dict):
 
     add_message("User", query)
     history = get_conversation_history()
-
-    # GraphRAG hybrid retrieval
     retrieval = hybrid_retrieve(query, top_k=5, similarity_threshold=1.5)
 
     if retrieval["retrieval_mode"] == "none":
@@ -324,7 +396,6 @@ async def chat(request: dict):
             "seed_entities": [],
         }
 
-    # Generate response with graph-enriched context
     ai_response = generate_graphrag_response(
         query=query,
         enriched_context=retrieval["enriched_context"],
@@ -345,6 +416,124 @@ async def chat(request: dict):
     }
 
 
+# ── Chat — SSE streaming  ─────────────────────────────────────────────────────
+
+@router.post("/chat/stream")
+async def chat_stream(request: dict):
+    """
+    Server-Sent Events streaming chat.
+
+    Yields newline-delimited SSE frames:
+      data: {"type": "token",  "content": "<text fragment>"}
+      data: {"type": "meta",   "retrieval_mode": "...", "seed_entities": [...],
+                               "sources": [...], "subgraph": {...}}
+      data: {"type": "done"}
+      data: {"type": "error",  "content": "<message>"}
+
+    The `subgraph` field in the meta frame contains the nodes/edges used
+    during retrieval so the frontend can render a "reasoning subgraph".
+    """
+    query = (request.get("query") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query is required")
+
+    add_message("User", query)
+    history = get_conversation_history()
+    retrieval = hybrid_retrieve(query, top_k=5, similarity_threshold=1.5)
+
+    # Build reasoning subgraph payload for the frontend
+    def _build_subgraph(seed_entities: list[str]) -> dict:
+        """
+        Return a small {nodes, links} structure covering only the nodes/edges
+        that were traversed to answer this query (up to 2 hops from seeds).
+        """
+        nodes_map: dict[str, dict] = {}
+        links: list[dict] = []
+        seen_links: set[tuple] = set()
+
+        for seed in seed_entities[:5]:
+            neighbors = get_neighbors(seed, max_hops=2, max_nodes=30)
+            # Seed itself
+            nodes_map[seed] = {"id": seed, "isSeed": True}
+            for nbr in neighbors:
+                nid = nbr["node"]
+                nodes_map.setdefault(nid, {"id": nid, "cluster": nbr["cluster"], "isSeed": False})
+                path = nbr["path"]
+                if len(path) >= 2:
+                    key = (path[-2], path[-1])
+                    if key not in seen_links:
+                        seen_links.add(key)
+                        links.append({
+                            "source": path[-2],
+                            "target": path[-1],
+                            "label": nbr["via"][0] if nbr["via"] else "→",
+                        })
+
+        return {"nodes": list(nodes_map.values()), "links": links}
+
+    async def event_stream():
+        if retrieval["retrieval_mode"] == "none":
+            msg = (
+                "I couldn't find relevant information in the uploaded documents. "
+                "Try uploading more documents or rephrasing your question."
+            )
+            yield f"data: {json.dumps({'type': 'token', 'content': msg})}\n\n"
+            add_message("AI", msg)
+            yield f"data: {json.dumps({'type': 'meta', 'retrieval_mode': 'none', 'seed_entities': [], 'sources': [], 'subgraph': {'nodes': [], 'links': []}})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
+
+        nvidia_key = os.getenv("NVIDIA_API_KEY")
+        if not nvidia_key:
+            yield f"data: {json.dumps({'type': 'error', 'content': 'NVIDIA_API_KEY is not configured on the server.'})}\n\n"
+            return
+
+        final_context = _build_graphrag_context(query, retrieval, history)
+
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=nvidia_key, base_url="https://integrate.api.nvidia.com/v1")
+            full_response = ""
+
+            stream = client.chat.completions.create(
+                model="meta/llama-3.1-70b-instruct",
+                messages=[
+                    {"role": "system", "content": NVIDIA_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Context from retrieved documents:\n{final_context}\n\nUser question:\n{query}"},
+                ],
+                temperature=0.3,
+                max_tokens=1024,
+                stream=True,
+            )
+
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    full_response += delta
+                    yield f"data: {json.dumps({'type': 'token', 'content': delta})}\n\n"
+
+            add_message("AI", full_response)
+
+            subgraph = _build_subgraph(retrieval["seed_entities"]) if retrieval["seed_entities"] else {"nodes": [], "links": []}
+
+            yield f"data: {json.dumps({'type': 'meta', 'retrieval_mode': retrieval['retrieval_mode'], 'seed_entities': retrieval['seed_entities'], 'sources': format_sources(retrieval['vector_chunks']), 'subgraph': subgraph})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+        except Exception as exc:
+            logger.exception("Streaming chat error for query '%s'", query)
+            yield f"data: {json.dumps({'type': 'error', 'content': f'LLM error: {exc}'})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 # ── Memory ────────────────────────────────────────────────────────────────────
 
 @router.post("/clear-memory")
@@ -357,15 +546,9 @@ async def reset_memory():
 
 @router.get("/knowledge-graph")
 async def knowledge_graph():
-    """
-    Returns graph data for the frontend.
-    Prefers the persistent NetworkX graph; falls back to legacy in-memory store.
-    """
     frontend_data = get_full_graph_for_frontend()
     if frontend_data:
         return {"success": True, "graph": frontend_data}
-
-    # Fallback: legacy in-memory list from knowledge_graph_service
     from app.services.knowledge_graph_service import get_knowledge_graph as legacy_get
     return {"success": True, "graph": legacy_get()}
 
@@ -374,16 +557,11 @@ async def knowledge_graph():
 
 @router.get("/graph/stats")
 async def graph_stats():
-    """Return NetworkX graph statistics."""
     return {"success": True, "stats": get_graph_stats()}
 
 
 @router.post("/graph/query")
 async def graph_query(body: dict):
-    """
-    Multi-hop entity query.
-    Body: {"entities": ["AWS Lambda", "API Gateway"], "hops": 2}
-    """
     entities = body.get("entities") or []
     hops = min(int(body.get("hops", 2)), 4)
 
@@ -407,7 +585,6 @@ async def graph_query(body: dict):
                 for n in nbrs[:20]
             ]
 
-    # Cross-entity paths
     paths = []
     if len(found) >= 2:
         for i, s1 in enumerate(found):
@@ -449,6 +626,9 @@ async def regenerate_wiki(body: dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="filename is required")
 
     file_path = os.path.join(UPLOAD_DIR, filename)
+    # Path traversal guard
+    if not os.path.realpath(file_path).startswith(os.path.realpath(UPLOAD_DIR)):
+        raise HTTPException(status_code=400, detail="Invalid filename")
     if not os.path.exists(file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

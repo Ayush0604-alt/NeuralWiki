@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import Upload from "./pages/Upload";
 import SearchBox from "./components/SearchBox";
 import ChatBox from "./components/ChatBox";
@@ -18,16 +18,34 @@ export default function App() {
   const [activeTab, setActiveTab] = useState("chat");
   const [backendStatus, setBackendStatus] = useState("checking");
 
-  const checkBackend = useCallback(async () => {
-    try {
-      const res = await fetch("http://127.0.0.1:8000/");
-      setBackendStatus(res.ok ? "online" : "offline");
-    } catch {
-      setBackendStatus("offline");
-    }
+  // ── Cross-component event bus for "knowledge base cleared" ──────────────────
+  // Upload calls notifyKbCleared(); ChatBox subscribes via onKnowledgeBaseCleared.
+  // Using a ref-based pub/sub so neither component needs to be remounted.
+  const kbClearedListeners = useRef([]);
+
+  const notifyKbCleared = useCallback(() => {
+    kbClearedListeners.current.forEach(fn => fn());
   }, []);
 
-  useState(() => { checkBackend(); }, []);
+  // Stable subscribe factory passed as prop to ChatBox.
+  // Returns an unsubscribe function (for useEffect cleanup).
+  const onKnowledgeBaseCleared = useCallback((listener) => {
+    kbClearedListeners.current.push(listener);
+    return () => {
+      kbClearedListeners.current = kbClearedListeners.current.filter(fn => fn !== listener);
+    };
+  }, []);
+
+  useState(() => {
+    (async () => {
+      try {
+        const res = await fetch("http://127.0.0.1:8000/");
+        setBackendStatus(res.ok ? "online" : "offline");
+      } catch {
+        setBackendStatus("offline");
+      }
+    })();
+  }, []);
 
   return (
     <div className="app-shell">
@@ -56,11 +74,15 @@ export default function App() {
       </header>
 
       <main className="main-content">
-        <div className={`tab-panel${activeTab === "chat"   ? " active" : ""}`}><ChatBox /></div>
+        <div className={`tab-panel${activeTab === "chat"   ? " active" : ""}`}>
+          <ChatBox onKnowledgeBaseCleared={onKnowledgeBaseCleared} />
+        </div>
         <div className={`tab-panel${activeTab === "wiki"   ? " active" : ""}`}><Wiki /></div>
         <div className={`tab-panel${activeTab === "search" ? " active" : ""}`}><SearchBox /></div>
         <div className={`tab-panel${activeTab === "graph"  ? " active" : ""}`}><KnowledgeGraph /></div>
-        <div className={`tab-panel${activeTab === "upload" ? " active" : ""}`}><Upload /></div>
+        <div className={`tab-panel${activeTab === "upload" ? " active" : ""}`}>
+          <Upload onKnowledgeBaseCleared={notifyKbCleared} />
+        </div>
       </main>
     </div>
   );
