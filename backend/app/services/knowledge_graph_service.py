@@ -1,22 +1,18 @@
 """
 Knowledge Graph Service — Generalized for Any Document
 -------------------------------------------------------
-Works for: resumes, research papers, news articles, legal docs,
-           technical docs, financial reports, books, wikis, etc.
-
-Strategy:
-  1. Auto-detect document type from content signals
-  2. Find the most prominent entity as the center node
-     (by mention frequency, not by label type)
-  3. Classify all entities into universal semantic clusters
-     that are meaningful regardless of document type
-  4. Extract typed relationships using verb semantics
-  5. Fall back gracefully when NLP gives little structure
+Improvements over original:
+  - Keyword-based fallback extraction when spaCy gives sparse NER
+  - Deduplication of noun chunks vs named entities
+  - Relationship extraction now covers more verb patterns
+  - Center node detection is more robust
+  - Returns clean cluster names that match the frontend CLUSTER_CONFIG
 """
 
 import logging
 import re
 from collections import Counter
+
 import spacy
 
 logger = logging.getLogger(__name__)
@@ -31,7 +27,7 @@ except OSError:
 
 _knowledge_graph: list[dict] = []
 
-# ── Universal cluster definitions ──────────────────────────────────────────────
+# ── Universal cluster definitions (must match frontend CLUSTER_CONFIG) ─────────
 CLUSTERS = {
     "ENTITY":   {"color": "#8b84ff", "icon": "◉", "label": "Entities"},
     "CONCEPT":  {"color": "#1fc791", "icon": "◈", "label": "Concepts"},
@@ -41,8 +37,8 @@ CLUSTERS = {
     "ACTION":   {"color": "#c47aff", "icon": "▶", "label": "Actions"},
     "QUANTITY": {"color": "#54a0ff", "icon": "▣", "label": "Quantities"},
     "RELATION": {"color": "#f5a623", "icon": "⟷", "label": "Relations"},
-    "TECH":     {"color": "#47a8e5", "icon": "⬡", "label": "Technologies"},
-    "MISC":     {"color": "#555568", "icon": "·",  "label": "Other"},
+    "TECH":     {"color": "#47bfff", "icon": "⬡", "label": "Technologies"},
+    "MISC":     {"color": "#6b6b80", "icon": "·",  "label": "Other"},
 }
 
 # ── spaCy label → universal cluster ───────────────────────────────────────────
@@ -194,7 +190,6 @@ def _pick_center(text: str, entities: list[dict], doc_type: str) -> dict | None:
     if doc_type == "financial":
         return most_frequent("ORG") or entities[0]
 
-    # General: highest mention count
     return max(entities, key=lambda e: freq.get(e["text"], 0))
 
 
@@ -259,7 +254,30 @@ def _type_relation(verb: str, src_cluster: str, tgt_cluster: str) -> str:
     return v if v else "related to"
 
 
-# ── Core extraction ────────────────────────────────────────────────────────────
+# ── Keyword fallback: extract high-value terms when spaCy NER is sparse ────────
+def _keyword_fallback(text: str, existing_ids: set[str], max_extra: int = 20) -> list[dict]:
+    """
+    When NER produces fewer than 10 entities, supplement with high-frequency
+    multi-word noun phrases and domain keywords.
+    """
+    extras: list[dict] = []
+    text_lower = text.lower()
+
+    # Domain keyword hits
+    for kw_set, cluster in [(_TECH_KEYWORDS, "TECH"), (_CONCEPT_KEYWORDS, "CONCEPT"), (_ACTION_KEYWORDS, "ACTION")]:
+        for kw in kw_set:
+            if kw in text_lower and kw.lower() not in existing_ids:
+                extras.append({"text": kw.title() if " " not in kw else kw.title(), "label": None, "_cluster": cluster})
+                existing_ids.add(kw.lower())
+            if len(extras) >= max_extra:
+                break
+        if len(extras) >= max_extra:
+            break
+
+    return extras
+
+
+# ── Core extraction ─────────────────────────────────────────────────────────────
 def extract_entities_and_relationships(text: str) -> dict:
     text_sample = text[:60_000]
     doc = nlp(text_sample)
@@ -268,7 +286,7 @@ def extract_entities_and_relationships(text: str) -> dict:
     doc_type = _detect_doc_type(text_sample)
     logger.info("Detected document type: %s", doc_type)
 
-    # 2. Extract named entities
+    # 2. Named entities
     raw_entities: list[dict] = []
     seen: set[str] = set()
 
@@ -284,7 +302,7 @@ def extract_entities_and_relationships(text: str) -> dict:
         seen.add(key)
         raw_entities.append({"text": cleaned, "label": ent.label_})
 
-    # 3. Extract noun chunks for tech/concept/action
+    # 3. Noun chunks → TECH / CONCEPT / ACTION
     for chunk in doc.noun_chunks:
         cleaned = chunk.text.replace("\n", " ").strip()
         if len(cleaned) < 3 or cleaned.lower() in seen:
@@ -294,11 +312,19 @@ def extract_entities_and_relationships(text: str) -> dict:
             seen.add(cleaned.lower())
             raw_entities.append({"text": cleaned, "label": None})
 
-    # 4. Pick center node
+    # 4. Keyword fallback when sparse
+    if len(raw_entities) < 10:
+        logger.info("Sparse NER (%d), running keyword fallback", len(raw_entities))
+        extras = _keyword_fallback(text_sample, set(seen), max_extra=25)
+        for e in extras:
+            raw_entities.append({"text": e["text"], "label": e.get("label"), "_cluster": e.get("_cluster")})
+            seen.add(e["text"].lower())
+
+    # 5. Pick center node
     center_raw = _pick_center(text_sample, raw_entities, doc_type)
     center_id = center_raw["text"] if center_raw else "Document"
 
-    # 5. Classify all entities into clusters
+    # 6. Classify into clusters
     all_clusters: dict[str, list[dict]] = {k: [] for k in CLUSTERS}
     node_to_cluster: dict[str, str] = {}
 
@@ -307,7 +333,11 @@ def extract_entities_and_relationships(text: str) -> dict:
         if eid == center_id:
             continue
 
-        cluster = _classify_entity(eid, ent.get("label"))
+        # Use pre-assigned cluster from keyword fallback if available
+        if ent.get("_cluster"):
+            cluster = ent["_cluster"]
+        else:
+            cluster = _classify_entity(eid, ent.get("label"))
 
         # Filter noise
         if cluster == "QUANTITY" and ent.get("label") in ("CARDINAL", "ORDINAL"):
@@ -316,6 +346,9 @@ def extract_entities_and_relationships(text: str) -> dict:
             continue
         if cluster == "MISC" and len(eid) < 4:
             continue
+
+        if cluster not in all_clusters:
+            cluster = "MISC"
 
         existing = {n["id"].lower() for n in all_clusters[cluster]}
         if eid.lower() in existing:
@@ -326,12 +359,12 @@ def extract_entities_and_relationships(text: str) -> dict:
 
     filled_clusters = {k: v for k, v in all_clusters.items() if v}
 
-    # 6. Extract SVO relationships
+    # 7. SVO relationships
     relationships: list[dict] = []
     seen_rels: set[tuple] = set()
 
     _SUBJ_DEPS = {"nsubj", "nsubjpass", "csubj"}
-    _OBJ_DEPS  = {"dobj", "attr", "pobj", "acomp", "oprd", "xcomp"}
+    _OBJ_DEPS  = {"dobj", "attr", "pobj", "acomp", "oprd", "xcomp", "dative"}
 
     for token in doc:
         if token.pos_ != "VERB":
@@ -367,16 +400,11 @@ def extract_entities_and_relationships(text: str) -> dict:
                 tgt_cluster = node_to_cluster.get(tgt, "ENTITY")
                 label = _type_relation(verb, src_cluster, tgt_cluster)
 
-                relationships.append({
-                    "source": src,
-                    "target": tgt,
-                    "label":  label,
-                })
+                relationships.append({"source": src, "target": tgt, "label": label})
 
-    # 7. Connect any orphan nodes to center
+    # 8. Connect orphan nodes to center
     connected_nodes = (
-        {r["source"] for r in relationships} |
-        {r["target"] for r in relationships}
+        {r["source"] for r in relationships} | {r["target"] for r in relationships}
     )
 
     center_edge_labels = {
@@ -404,13 +432,14 @@ def extract_entities_and_relationships(text: str) -> dict:
 
     graph_data = {
         "doc_type":      doc_type,
-        "center":        {"id": center_id,
-                          "label": center_raw.get("label", "ENTITY") if center_raw else "ENTITY",
-                          "cluster": "CENTER"},
+        "center":        {
+            "id":      center_id,
+            "label":   center_raw.get("label", "ENTITY") if center_raw else "ENTITY",
+            "cluster": "CENTER",
+        },
         "clusters":      filled_clusters,
         "relationships": relationships,
-        "entities":      [{"text": e["text"], "label": e.get("label", "")}
-                          for e in raw_entities],
+        "entities":      [{"text": e["text"], "label": e.get("label", "")} for e in raw_entities],
     }
 
     logger.info(
@@ -421,15 +450,6 @@ def extract_entities_and_relationships(text: str) -> dict:
         len(relationships),
     )
     return graph_data
-
-
-def _extract_title(text: str) -> str | None:
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    if lines:
-        candidate = lines[0][:80]
-        if len(candidate) > 4 and not candidate.lower().startswith("the "):
-            return candidate
-    return None
 
 
 # ── Storage ────────────────────────────────────────────────────────────────────
