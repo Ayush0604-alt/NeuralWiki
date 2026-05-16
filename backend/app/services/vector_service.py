@@ -1,16 +1,14 @@
 """
 Vector Service
 --------------
-ChromaDB wrapper — updated to store entity tags per chunk.
+ChromaDB wrapper — updated for true hybrid retrieval.
 
 Changes vs original:
-  • store_embeddings() now accepts optional entity list per chunk
-    and persists it as a JSON-encoded metadata field ("entities")
+  • store_embeddings() persists entity tags per chunk as JSON metadata
   • semantic_search() returns entity tags with each result
-  • entity_filtered_search() — NEW: filter by seed entities before
-    doing similarity ranking; this is the real hybrid retrieval win
-  • Default similarity_threshold tightened to 0.7 (was 1.5)
-    to reduce noise in the LLM context window
+  • entity_filtered_search() — NEW: boosts chunks containing seed entities
+    before cosine ranking, so the graph drives what surfaces
+  • DEFAULT_SIMILARITY_THRESHOLD = 0.7 (was 1.5) — far less noise
 """
 
 import json
@@ -23,8 +21,7 @@ logger = logging.getLogger(__name__)
 _client = chromadb.PersistentClient(path="chroma_db")
 _COLLECTION_NAME = "neuralwiki"
 
-# ── Tightened default — change here affects all callers that don't override ───
-DEFAULT_SIMILARITY_THRESHOLD = 0.7
+DEFAULT_SIMILARITY_THRESHOLD = 0.7   # was 1.5 — tighter = less hallucination
 
 
 def _get_collection():
@@ -37,25 +34,19 @@ def _get_collection():
 
 def store_embeddings(filename: str, embedded_chunks: list[dict]) -> None:
     """
-    Store embeddings in ChromaDB.
-
-    Each chunk may optionally carry an "entities" key (list[str]) from the
-    chunk-to-entity linking step in knowledge_graph_service.py.
-    Those entity tags are serialised to JSON and stored as metadata so
-    entity_filtered_search() can retrieve them cheaply later.
+    Store embeddings. Each chunk may carry an "entities" key (list[str])
+    from link_entities_to_chunks(). Stored as JSON in ChromaDB metadata.
     """
     collection = _get_collection()
     for chunk in embedded_chunks:
-        # Serialise entity list (may be absent for old-style chunks)
         entities_json = json.dumps(chunk.get("entities", []))
-
         collection.add(
             documents=[chunk["content"]],
             embeddings=[chunk["embedding"]],
             metadatas=[{
                 "source":   filename,
                 "chunk_id": chunk["chunk_id"],
-                "entities": entities_json,          # NEW
+                "entities": entities_json,
             }],
             ids=[f"{filename}_{chunk['chunk_id']}"],
         )
@@ -66,14 +57,18 @@ def store_embeddings(filename: str, embedded_chunks: list[dict]) -> None:
 # Read
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _parse_entities(raw) -> list[str]:
+    try:
+        return json.loads(raw) if isinstance(raw, str) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def semantic_search(
     query_embedding,
     top_k: int = 5,
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
 ) -> list[dict]:
-    """
-    Standard semantic search.  Tighter default threshold (0.7) reduces noise.
-    """
     collection = _get_collection()
     if collection.count() == 0:
         return []
@@ -84,33 +79,22 @@ def semantic_search(
     )
 
     formatted = []
-    seen_content: set[str] = set()
+    seen: set[str] = set()
 
-    for doc, metadata, distance in zip(
+    for doc, meta, dist in zip(
         results["documents"][0],
         results["metadatas"][0],
         results["distances"][0],
     ):
-        if distance > similarity_threshold:
+        if dist > similarity_threshold or doc in seen:
             continue
-        if doc in seen_content:
-            continue
-        seen_content.add(doc)
-
-        # Deserialise entity tags stored at index time
-        entities: list[str] = []
-        raw = metadata.get("entities", "[]")
-        try:
-            entities = json.loads(raw) if isinstance(raw, str) else []
-        except (json.JSONDecodeError, TypeError):
-            entities = []
-
+        seen.add(doc)
         formatted.append({
             "content":          doc,
-            "source":           metadata["source"],
-            "chunk_id":         metadata["chunk_id"],
-            "similarity_score": round(distance, 4),
-            "entities":         entities,            # NEW — passed through
+            "source":           meta["source"],
+            "chunk_id":         meta["chunk_id"],
+            "similarity_score": round(dist, 4),
+            "entities":         _parse_entities(meta.get("entities", "[]")),
         })
 
     return formatted
@@ -124,31 +108,20 @@ def entity_filtered_search(
     entity_boost: float = 0.15,
 ) -> list[dict]:
     """
-    Hybrid entity-aware retrieval — NEW.
+    Hybrid entity-aware retrieval.
 
-    Algorithm:
-    1. Run a wider semantic search (top_k * 3) to get candidates.
-    2. For each candidate, count how many seed_entities it contains.
-    3. Apply a score boost proportional to entity overlap.
-    4. Re-rank and return top_k.
+    1. Fetch wider candidate pool (4× top_k)
+    2. Score each chunk by entity overlap with seed_entities
+    3. Reduce distance by entity_boost per matched entity
+    4. Re-rank by adjusted score, return top_k
 
-    This means a chunk that mentions "AWS Lambda" and "API Gateway" will rank
-    higher than a generic chunk with slightly better cosine similarity.
-
-    Parameters
-    ----------
-    query_embedding    : embedding vector
-    seed_entities      : list of canonical entity strings from graph traversal
-    top_k              : final number of results to return
-    similarity_threshold : max cosine distance to consider (lower = stricter)
-    entity_boost       : distance reduction per matched seed entity
-                         (0.15 means matching 2 entities → -0.30 on distance)
+    A chunk mentioning 3 seed entities gets distance reduced by 0.45,
+    which can move it from rank 8 to rank 1. The graph now drives retrieval.
     """
     collection = _get_collection()
     if collection.count() == 0:
         return []
 
-    # Wider initial fetch
     wide_k = min(top_k * 4, collection.count())
     results = collection.query(
         query_embeddings=[query_embedding],
@@ -157,59 +130,49 @@ def entity_filtered_search(
 
     seed_lower = {e.lower() for e in seed_entities}
     candidates = []
-    seen_content: set[str] = set()
+    seen: set[str] = set()
 
-    for doc, metadata, distance in zip(
+    for doc, meta, dist in zip(
         results["documents"][0],
         results["metadatas"][0],
         results["distances"][0],
     ):
-        if distance > similarity_threshold + 0.3:   # wider initial window
+        # Wider initial window — we re-filter after boosting
+        if dist > similarity_threshold + 0.3 or doc in seen:
             continue
-        if doc in seen_content:
-            continue
-        seen_content.add(doc)
+        seen.add(doc)
 
-        # Deserialise stored entity tags
-        chunk_entities: list[str] = []
-        raw = metadata.get("entities", "[]")
-        try:
-            chunk_entities = json.loads(raw) if isinstance(raw, str) else []
-        except (json.JSONDecodeError, TypeError):
-            chunk_entities = []
-
-        # Count entity overlap with seed entities
+        chunk_entities = _parse_entities(meta.get("entities", "[]"))
         chunk_lower = {e.lower() for e in chunk_entities}
+
+        # Count exact tag matches
         overlap = len(seed_lower & chunk_lower)
 
-        # Also do a quick substring scan for seeds not tagged at index time
+        # Partial credit: seed appears in content but wasn't tagged at index time
         content_lower = doc.lower()
         for seed in seed_lower:
             if seed not in chunk_lower and seed in content_lower:
-                overlap += 0.5   # partial credit for untagged mentions
+                overlap += 0.5
 
-        # Adjusted score: lower is better (cosine distance)
-        adjusted_distance = distance - (overlap * entity_boost)
+        adjusted = dist - (overlap * entity_boost)
 
         candidates.append({
             "content":          doc,
-            "source":           metadata["source"],
-            "chunk_id":         metadata["chunk_id"],
-            "similarity_score": round(distance, 4),
-            "adjusted_score":   round(adjusted_distance, 4),
+            "source":           meta["source"],
+            "chunk_id":         meta["chunk_id"],
+            "similarity_score": round(dist, 4),
+            "adjusted_score":   round(adjusted, 4),
             "entities":         chunk_entities,
             "entity_overlap":   overlap,
         })
 
-    # Filter by adjusted score, then rank
     filtered = [c for c in candidates if c["adjusted_score"] <= similarity_threshold]
     filtered.sort(key=lambda x: x["adjusted_score"])
 
     logger.debug(
-        "EntityFilteredSearch: %d candidates → %d after threshold → returning %d",
+        "EntityFilteredSearch: %d candidates → %d filtered → %d returned",
         len(candidates), len(filtered), min(top_k, len(filtered)),
     )
-
     return filtered[:top_k]
 
 
@@ -222,10 +185,7 @@ def list_documents() -> list[dict]:
     for meta in all_meta:
         src = meta.get("source", "unknown")
         counts[src] = counts.get(src, 0) + 1
-    return [
-        {"filename": name, "chunks": count}
-        for name, count in sorted(counts.items())
-    ]
+    return [{"filename": name, "chunks": count} for name, count in sorted(counts.items())]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -236,15 +196,12 @@ def delete_document(filename: str) -> int:
     collection = _get_collection()
     if collection.count() == 0:
         return 0
-    results = collection.get(
-        where={"source": filename},
-        include=["metadatas"],
-    )
-    ids_to_delete = results.get("ids", [])
-    if ids_to_delete:
-        collection.delete(ids=ids_to_delete)
-        logger.info("Deleted %d chunks for '%s'", len(ids_to_delete), filename)
-    return len(ids_to_delete)
+    results = collection.get(where={"source": filename}, include=["metadatas"])
+    ids = results.get("ids", [])
+    if ids:
+        collection.delete(ids=ids)
+        logger.info("Deleted %d chunks for '%s'", len(ids), filename)
+    return len(ids)
 
 
 def clear_all_documents() -> int:
@@ -252,5 +209,5 @@ def clear_all_documents() -> int:
     total = collection.count()
     _client.delete_collection(_COLLECTION_NAME)
     _client.get_or_create_collection(_COLLECTION_NAME)
-    logger.info("Vector store cleared (%d chunks removed)", total)
+    logger.info("Vector store cleared (%d chunks)", total)
     return total

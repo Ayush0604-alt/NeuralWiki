@@ -1,56 +1,69 @@
 """
-Knowledge Graph Service — Generalized for Any Document
--------------------------------------------------------
-Improvements in this version:
-  - Entity deduplication via fuzzy string matching (rapidfuzz/thefuzz)
-  - Co-reference normalization: "AWS Lambda", "Lambda", "lambda function" → merged
-  - LLM-based relation extraction fallback for richer relationships
-  - Chunk-to-entity linking: each chunk tagged with contained entities
-  - Center node detection is more robust
-  - Returns clean cluster names that match the frontend CLUSTER_CONFIG
+Knowledge Graph Service — True GraphRAG Edition
+------------------------------------------------
+Complete rewrite. Key differences from the hub-and-spoke version:
 
-Install requirements:
-    pip install rapidfuzz          # fast fuzzy dedup (preferred)
-    # OR: pip install thefuzz[speedup]
+EXTRACTION (3 layers):
+  Layer 1 — spaCy SVO:       Explicit verb-subject-object triples
+  Layer 2 — Co-occurrence:   Entities in the same sentence get weighted
+                              edges proportional to co-occurrence count
+  Layer 3 — LLM extraction:  NVIDIA API call per text window for semantic
+                              relationships spaCy misses entirely
+                              (comparisons, causality, hierarchy, negations)
+
+GRAPH STRUCTURE (no hub-and-spoke):
+  • Orphan nodes are NOT force-connected to the center
+  • Disconnected components are bridged via their highest-degree node
+    (minimum spanning approach) — max 1 edge per component pair
+  • Center node = highest-degree node AFTER all edges are built,
+    not an artificially chosen hub
+
+DEDUPLICATION:
+  • Fuzzy entity merging (rapidfuzz if available, else basic normalisation)
+
+CHUNK LINKING:
+  • link_entities_to_chunks() tags every chunk with its contained entities
+    enabling genuine entity-filtered retrieval in vector_service.py
 """
 
+from __future__ import annotations
+
 import logging
+import os
 import re
-from collections import Counter, defaultdict
+from collections import defaultdict
+from itertools import combinations
 
 import spacy
 
 logger = logging.getLogger(__name__)
 
-# ── Optional: rapidfuzz for entity deduplication ──────────────────────────────
+# ── Optional fuzzy dedup ───────────────────────────────────────────────────────
 try:
-    from rapidfuzz import fuzz, process as rfuzz_process
-    _FUZZY_AVAILABLE = True
-    logger.info("rapidfuzz available — entity deduplication enabled")
+    from rapidfuzz import fuzz
+    _FUZZY = True
 except ImportError:
     try:
-        from thefuzz import fuzz, process as rfuzz_process
-        _FUZZY_AVAILABLE = True
-        logger.info("thefuzz available — entity deduplication enabled")
+        from thefuzz import fuzz
+        _FUZZY = True
     except ImportError:
-        _FUZZY_AVAILABLE = False
-        logger.warning(
-            "Neither rapidfuzz nor thefuzz installed. "
-            "Entity deduplication disabled. "
-            "Run: pip install rapidfuzz"
-        )
+        _FUZZY = False
+        logger.warning("rapidfuzz/thefuzz not installed — basic dedup only. pip install rapidfuzz")
+
+# ── Optional LLM extraction ────────────────────────────────────────────────────
+_NVIDIA_KEY = os.getenv("NVIDIA_API_KEY")
+_LLM_EXTRACTION_ENABLED = bool(_NVIDIA_KEY)
+if not _LLM_EXTRACTION_ENABLED:
+    logger.warning("NVIDIA_API_KEY not set — LLM relation extraction disabled")
 
 try:
     nlp = spacy.load("en_core_web_sm")
 except OSError:
-    raise RuntimeError(
-        "spaCy model 'en_core_web_sm' not found. "
-        "Run: python -m spacy download en_core_web_sm"
-    )
+    raise RuntimeError("Run: python -m spacy download en_core_web_sm")
 
 _knowledge_graph: list[dict] = []
 
-# ── Universal cluster definitions (must match frontend CLUSTER_CONFIG) ─────────
+# ── Cluster config ─────────────────────────────────────────────────────────────
 CLUSTERS = {
     "ENTITY":   {"color": "#8b84ff", "icon": "◉", "label": "Entities"},
     "CONCEPT":  {"color": "#1fc791", "icon": "◈", "label": "Concepts"},
@@ -59,207 +72,565 @@ CLUSTERS = {
     "DATE":     {"color": "#00d2d3", "icon": "◇", "label": "Dates"},
     "ACTION":   {"color": "#c47aff", "icon": "▶", "label": "Actions"},
     "QUANTITY": {"color": "#54a0ff", "icon": "▣", "label": "Quantities"},
-    "RELATION": {"color": "#f5a623", "icon": "⟷", "label": "Relations"},
     "TECH":     {"color": "#47bfff", "icon": "⬡", "label": "Technologies"},
     "MISC":     {"color": "#6b6b80", "icon": "·",  "label": "Other"},
 }
 
-# ── spaCy label → universal cluster ───────────────────────────────────────────
 _SPACY_TO_CLUSTER = {
-    "PERSON":      "ENTITY",
-    "ORG":         "ENTITY",
-    "PRODUCT":     "ENTITY",
-    "WORK_OF_ART": "ENTITY",
-    "GPE":         "LOCATION",
-    "LOC":         "LOCATION",
-    "FAC":         "LOCATION",
-    "EVENT":       "EVENT",
-    "LANGUAGE":    "TECH",
-    "LAW":         "CONCEPT",
-    "NORP":        "ENTITY",
-    "DATE":        "DATE",
-    "TIME":        "DATE",
-    "MONEY":       "QUANTITY",
-    "PERCENT":     "QUANTITY",
-    "CARDINAL":    "QUANTITY",
-    "ORDINAL":     "QUANTITY",
-    "QUANTITY":    "QUANTITY",
+    "PERSON": "ENTITY", "ORG": "ENTITY", "PRODUCT": "ENTITY",
+    "WORK_OF_ART": "ENTITY", "NORP": "ENTITY",
+    "GPE": "LOCATION", "LOC": "LOCATION", "FAC": "LOCATION",
+    "EVENT": "EVENT",
+    "LANGUAGE": "TECH", "LAW": "CONCEPT",
+    "DATE": "DATE", "TIME": "DATE",
+    "MONEY": "QUANTITY", "PERCENT": "QUANTITY",
+    "CARDINAL": "QUANTITY", "ORDINAL": "QUANTITY", "QUANTITY": "QUANTITY",
 }
 
-_TECH_KEYWORDS = {
-    "python", "java", "javascript", "typescript", "c++", "c#", "ruby",
-    "golang", "go", "rust", "swift", "kotlin", "scala", "r", "matlab",
-    "php", "html", "css", "sql", "bash", "shell", "perl", "haskell",
-    "assembly", "fortran", "cobol", "dart", "lua",
-    "react", "angular", "vue", "svelte", "django", "flask", "fastapi",
-    "spring", "express", "rails", "laravel", "tensorflow", "pytorch",
-    "keras", "sklearn", "pandas", "numpy", "scipy", "spark", "hadoop",
-    "kafka", "rabbitmq", "celery",
-    "docker", "kubernetes", "k8s", "aws", "azure", "gcp", "git",
-    "github", "gitlab", "jenkins", "terraform", "ansible", "nginx",
-    "apache", "linux", "ubuntu", "windows",
-    "postgresql", "mysql", "mongodb", "redis", "cassandra", "sqlite",
-    "oracle", "dynamodb", "elasticsearch", "neo4j",
-    "rest", "graphql", "grpc", "soap", "http", "https", "tcp", "udp",
-    "websocket", "oauth", "jwt", "api", "sdk", "cli",
-    "machine learning", "deep learning", "neural network", "nlp",
-    "computer vision", "reinforcement learning", "transformer",
-    "bert", "gpt", "llm", "embedding", "vector", "rag",
-    "algorithm", "microservice", "serverless", "blockchain", "iot",
+_TECH_KW = {
+    "python","java","javascript","typescript","c++","c#","ruby","golang","go",
+    "rust","swift","kotlin","scala","php","html","css","sql","bash","shell",
+    "react","angular","vue","svelte","django","flask","fastapi","spring",
+    "express","tensorflow","pytorch","keras","sklearn","pandas","numpy","scipy",
+    "spark","hadoop","kafka","docker","kubernetes","k8s","aws","azure","gcp",
+    "git","github","gitlab","jenkins","terraform","nginx","linux","ubuntu",
+    "postgresql","mysql","mongodb","redis","cassandra","sqlite","elasticsearch",
+    "rest","graphql","grpc","http","websocket","oauth","jwt","api","sdk","cli",
+    "machine learning","deep learning","neural network","nlp","computer vision",
+    "transformer","bert","gpt","llm","embedding","vector","rag","blockchain",
+    "microservice","serverless","iot","algorithm",
 }
-
-_CONCEPT_KEYWORDS = {
-    "physics", "chemistry", "biology", "mathematics", "statistics",
-    "economics", "sociology", "psychology", "philosophy", "history",
-    "literature", "linguistics", "anthropology", "astronomy", "ecology",
-    "neuroscience", "genetics",
-    "strategy", "management", "leadership", "innovation", "marketing",
-    "finance", "accounting", "operations", "logistics", "supply chain",
-    "entrepreneurship", "revenue", "profit", "loss", "budget",
-    "theory", "hypothesis", "methodology", "framework", "model",
-    "analysis", "synthesis", "evaluation", "taxonomy", "ontology",
-    "paradigm", "empirical", "qualitative", "quantitative",
-    "policy", "regulation", "legislation", "compliance", "governance",
-    "constitution", "treaty", "statute", "clause",
-    "concept", "principle", "approach", "perspective",
-    "ideology", "belief", "culture", "ethics", "morality", "justice",
+_CONCEPT_KW = {
+    "strategy","management","leadership","innovation","marketing","finance",
+    "theory","hypothesis","methodology","framework","model","analysis",
+    "policy","regulation","compliance","governance","ethics","culture",
+    "economics","statistics","psychology","philosophy","research",
 }
-
-_ACTION_KEYWORDS = {
-    "process", "procedure", "method", "technique", "approach",
-    "implementation", "deployment", "installation", "configuration",
-    "integration", "migration", "optimization", "evaluation",
-    "assessment", "testing", "debugging", "monitoring",
-    "analysis", "research", "investigation", "experiment", "study",
-    "review", "audit", "inspection", "validation", "verification",
-    "training", "development", "building", "creation",
-    "design", "planning", "scheduling", "execution", "delivery",
-    "collaboration", "communication", "negotiation",
-    "publication", "presentation", "documentation",
+_ACTION_KW = {
+    "process","procedure","method","technique","implementation","deployment",
+    "integration","optimization","testing","evaluation","assessment","training",
+    "development","design","planning","execution","collaboration",
 }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Entity deduplication — NEW
+# Classification helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _classify(text: str, spacy_label: str | None) -> str:
+    s = text.strip()
+    if not s or len(s) < 2:
+        return "MISC"
+    if re.fullmatch(r"[\d,.\s%$€£¥]+", s):
+        return "QUANTITY"
+    if spacy_label and spacy_label in _SPACY_TO_CLUSTER:
+        base = _SPACY_TO_CLUSTER[spacy_label]
+        if base == "ENTITY" and s.lower() in _TECH_KW:
+            return "TECH"
+        return base
+    lo = s.lower()
+    if any(k in lo for k in _TECH_KW):    return "TECH"
+    if any(k in lo for k in _CONCEPT_KW): return "CONCEPT"
+    if any(k in lo for k in _ACTION_KW):  return "ACTION"
+    return "MISC"
+
+
+def _detect_doc_type(text: str) -> str:
+    lo = text[:3000].lower()
+    signals = {
+        "resume":    ["experience","education","skills","curriculum vitae","cv","work history"],
+        "research":  ["abstract","methodology","conclusion","hypothesis","findings","literature review"],
+        "news":      ["reported","according to","announced","journalist","breaking"],
+        "legal":     ["whereas","hereinafter","plaintiff","defendant","pursuant","jurisdiction"],
+        "technical": ["installation","configuration","api","endpoint","function","documentation"],
+        "financial": ["revenue","profit","ebitda","fiscal","quarter","balance sheet"],
+    }
+    scores = {dt: sum(1 for kw in kws if kw in lo) for dt, kws in signals.items()}
+    best = max(scores, key=scores.get)
+    return best if scores[best] >= 2 else "general"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Deduplication
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_dedup_map(entities: list[dict], threshold: int = 82) -> dict[str, str]:
-    """
-    Build a {variant → canonical} map using fuzzy string matching.
-
-    Rules (applied in order):
-    1. Exact case-insensitive match         → merge
-    2. One is a substring of the other      → keep the longer one
-    3. Fuzzy ratio >= threshold             → keep the one with higher
-                                              frequency (or longer if tied)
-
-    Returns a dict: raw_text → canonical_text
-    Only variants that DIFFER from their canonical are included.
-
-    Requires rapidfuzz or thefuzz to be installed; if neither is available,
-    returns an empty dict (no deduplication, safe degradation).
-    """
-    if not _FUZZY_AVAILABLE or not entities:
+    """Build {variant → canonical} using fuzzy matching + substring rules."""
+    if not entities:
         return {}
 
-    # Collect unique texts + frequencies
     freq: dict[str, int] = defaultdict(int)
     for e in entities:
         freq[e["text"].strip()] += 1
 
-    texts = list(freq.keys())
-    dedup_map: dict[str, str] = {}          # variant → canonical
-    canonical_set: set[str] = set(texts)    # start: every text is its own canonical
+    texts = sorted(freq.keys(), key=len, reverse=True)
+    dedup: dict[str, str] = {}
+    merged: set[str] = set()
 
-    # Sort longest-first so substrings are handled correctly
-    texts_sorted = sorted(texts, key=len, reverse=True)
-
-    merged: set[str] = set()   # texts that have been absorbed into another
-
-    for i, a in enumerate(texts_sorted):
+    for i, a in enumerate(texts):
         if a in merged:
             continue
-        a_lower = a.lower()
-
-        for b in texts_sorted[i + 1:]:
+        al = a.lower()
+        for b in texts[i + 1:]:
             if b in merged:
                 continue
-            b_lower = b.lower()
-
-            # Rule 1: exact case-insensitive
-            if a_lower == b_lower:
-                # keep the one with higher freq, or the longer one
+            bl = b.lower()
+            if al == bl:
                 keep, drop = (a, b) if freq[a] >= freq[b] else (b, a)
-                dedup_map[drop] = keep
+                dedup[drop] = keep
                 merged.add(drop)
                 continue
-
-            # Rule 2: substring containment
-            if b_lower in a_lower:
-                # a contains b → keep a
-                dedup_map[b] = a
+            if bl in al:
+                dedup[b] = a
                 merged.add(b)
                 continue
-            if a_lower in b_lower:
-                # b contains a → keep b
-                dedup_map[a] = b
+            if al in bl:
+                dedup[a] = b
                 merged.add(a)
-                break   # a is gone; move to next i
-
-            # Rule 3: fuzzy ratio
-            if _FUZZY_AVAILABLE:
-                score = fuzz.token_sort_ratio(a_lower, b_lower)
-                if score >= threshold:
+                break
+            if _FUZZY:
+                if fuzz.token_sort_ratio(al, bl) >= threshold:
                     keep, drop = (a, b) if freq[a] >= freq[b] else (b, a)
-                    dedup_map[drop] = keep
+                    dedup[drop] = keep
                     merged.add(drop)
 
-    logger.debug(
-        "Entity deduplication: %d raw → %d canonical (%d merged)",
-        len(texts), len(texts) - len(merged), len(merged),
-    )
-    return dedup_map
+    logger.info("Dedup: %d raw → %d canonical (%d merged)",
+                len(texts), len(texts) - len(merged), len(merged))
+    return dedup
 
 
-def _apply_dedup(entities: list[dict], dedup_map: dict[str, str]) -> list[dict]:
-    """Apply the dedup map, returning only canonical entities."""
-    if not dedup_map:
-        return entities
+def _apply_dedup(entities: list[dict], dm: dict[str, str]) -> list[dict]:
     seen: set[str] = set()
-    result: list[dict] = []
-    for e in entities:
-        canonical = dedup_map.get(e["text"], e["text"])
-        if canonical not in seen:
-            seen.add(canonical)
-            result.append({**e, "text": canonical})
-    return result
-
-
-def _remap_relationships(
-    relationships: list[dict],
-    dedup_map: dict[str, str],
-) -> list[dict]:
-    """Rewrite source/target in relationships using the canonical names."""
-    if not dedup_map:
-        return relationships
     out: list[dict] = []
-    seen_rels: set[tuple] = set()
-    for r in relationships:
-        src = dedup_map.get(r["source"], r["source"])
-        tgt = dedup_map.get(r["target"], r["target"])
-        lbl = r["label"]
-        if src == tgt:
-            continue
-        key = (src, tgt, lbl)
-        if key in seen_rels:
-            continue
-        seen_rels.add(key)
-        out.append({"source": src, "target": tgt, "label": lbl})
+    for e in entities:
+        c = dm.get(e["text"], e["text"])
+        if c not in seen:
+            seen.add(c)
+            out.append({**e, "text": c})
     return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Chunk-to-entity linking — NEW
+# Layer 1 — spaCy SVO extraction
+# ══════════════════════════════════════════════════════════════════════════════
+
+_VERB_MAP = {
+    "develop":"developed","build":"built","create":"created","design":"designed",
+    "implement":"implemented","use":"uses","apply":"applies","work":"worked at",
+    "found":"founded","lead":"leads","manage":"manages","join":"joined",
+    "publish":"published","write":"authored","research":"researched",
+    "study":"studied","analyze":"analyzed","propose":"proposed",
+    "introduce":"introduced","describe":"describes","include":"includes",
+    "contain":"contains","support":"supports","enable":"enables",
+    "require":"requires","provide":"provides","show":"shows",
+    "improve":"improves","increase":"increases","reduce":"reduces",
+    "affect":"affects","impact":"impacts","cause":"causes",
+    "integrate":"integrates with","collaborate":"collaborates with",
+    "acquire":"acquired","merge":"merged with","invest":"invested in",
+    "release":"released","launch":"launched","deploy":"deployed",
+    "compare":"compared to","outperform":"outperforms","replace":"replaces",
+    "depend":"depends on","base":"based on","derive":"derived from",
+}
+
+_PAIR_MAP = {
+    ("ENTITY","LOCATION"):"located in",   ("ENTITY","ENTITY"):"associated with",
+    ("ENTITY","CONCEPT"):"related to",    ("ENTITY","TECH"):"uses",
+    ("ENTITY","EVENT"):"participated in", ("CONCEPT","CONCEPT"):"related to",
+    ("CONCEPT","TECH"):"implemented via", ("TECH","TECH"):"integrates with",
+    ("ACTION","ENTITY"):"involves",       ("ACTION","CONCEPT"):"applies to",
+}
+
+_SUBJ = {"nsubj", "nsubjpass", "csubj"}
+_OBJ  = {"dobj", "attr", "pobj", "acomp", "oprd", "xcomp", "dative"}
+
+
+def _svo_extract(doc, known: set[str], dm: dict[str, str]) -> list[dict]:
+    rels: list[dict] = []
+    seen: set[tuple] = set()
+
+    for token in doc:
+        if token.pos_ != "VERB":
+            continue
+        subjs = [c for c in token.children if c.dep_ in _SUBJ]
+        objs  = [c for c in token.children if c.dep_ in _OBJ]
+        for child in token.children:
+            if child.dep_ == "prep":
+                for pobj in child.children:
+                    if pobj.dep_ in ("pobj", "pcomp"):
+                        objs.append(pobj)
+
+        for s in subjs:
+            for o in objs:
+                src = dm.get(s.text.strip(), s.text.strip())
+                tgt = dm.get(o.text.strip(), o.text.strip())
+                verb = token.lemma_.lower()
+                if len(src) < 2 or len(tgt) < 2 or src == tgt:
+                    continue
+                if src not in known or tgt not in known:
+                    continue
+                if (src, tgt) in seen:
+                    continue
+                seen.add((src, tgt))
+                label = _VERB_MAP.get(verb)
+                if not label:
+                    sc, tc = _classify(src, None), _classify(tgt, None)
+                    label = _PAIR_MAP.get((sc, tc), verb or "related to")
+                rels.append({"source": src, "target": tgt, "label": label, "weight": 2.0})
+
+    logger.info("SVO relationships: %d", len(rels))
+    return rels
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Layer 2 — Co-occurrence (sentence-level)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _cooccurrence_extract(
+    doc,
+    known: set[str],
+    dm: dict[str, str],
+    min_cooccur: int = 2,
+) -> list[dict]:
+    """
+    Entities sharing the same sentence get a weighted co-occurrence edge.
+    Weight = number of sentences they share. Only emit if weight >= min_cooccur.
+    """
+    cooccur: dict[tuple[str, str], int] = defaultdict(int)
+
+    for sent in doc.sents:
+        sent_text = sent.text.lower()
+        present = [dm.get(e, e) for e in known if e.lower() in sent_text]
+        present = list(dict.fromkeys(present))  # deduplicate order
+        for a, b in combinations(sorted(present), 2):
+            if a != b:
+                key = (min(a, b), max(a, b))
+                cooccur[key] += 1
+
+    rels = []
+    for (a, b), count in cooccur.items():
+        if count >= min_cooccur:
+            rels.append({
+                "source": a, "target": b,
+                "label": "co-occurs with",
+                "weight": float(count),
+            })
+
+    logger.info("Co-occurrence: %d pairs (min_cooccur=%d)", len(rels), min_cooccur)
+    return rels
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Layer 3 — LLM relation extraction
+# ══════════════════════════════════════════════════════════════════════════════
+
+_LLM_REL_PROMPT = """You are a knowledge graph extractor. Given text and a list of entities, find relationships between THOSE entities only.
+
+Return ONLY a JSON array of objects with keys: source, target, label.
+- source and target must be exact strings from the entity list
+- label: short verb phrase (2-5 words), e.g. "is part of", "outperforms", "depends on", "is type of", "enables", "contradicts"
+- NO self-loops, NO duplicate pairs, NO vague labels like "related to"
+- Focus on: causality, hierarchy, comparison, dependency, composition, contrast
+
+Entity list: {entities}
+
+Text:
+{text}
+
+JSON array only (no markdown, no explanation):"""
+
+
+def _llm_extract_window(text_window: str, entities: list[str]) -> list[dict]:
+    if not _LLM_EXTRACTION_ENABLED or len(entities) < 2:
+        return []
+    import json as _json
+    from openai import OpenAI
+    client = OpenAI(api_key=_NVIDIA_KEY, base_url="https://integrate.api.nvidia.com/v1")
+    prompt = _LLM_REL_PROMPT.format(
+        entities=", ".join(entities[:40]),
+        text=text_window[:2000],
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="meta/llama-3.1-70b-instruct",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=800,
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = _json.loads(raw)
+        if isinstance(parsed, list):
+            return parsed
+    except Exception as exc:
+        logger.warning("LLM extraction failed: %s", exc)
+    return []
+
+
+def _llm_extract_all(
+    text: str,
+    known: set[str],
+    dm: dict[str, str],
+    window_size: int = 1500,
+) -> list[dict]:
+    if not _LLM_EXTRACTION_ENABLED:
+        return []
+
+    # Split into sentence-aware windows
+    sentences = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
+    windows: list[str] = []
+    current = ""
+    for s in sentences:
+        if len(current) + len(s) < window_size:
+            current += s + " "
+        else:
+            if current:
+                windows.append(current.strip())
+            current = s + " "
+    if current:
+        windows.append(current.strip())
+
+    entity_list = sorted(known)
+    all_rels: list[dict] = []
+    seen_pairs: set[tuple] = set()
+
+    for window in windows[:12]:  # cap at 12 to control API cost
+        for r in _llm_extract_window(window, entity_list):
+            src_raw = str(r.get("source", "")).strip()
+            tgt_raw = str(r.get("target", "")).strip()
+            label   = str(r.get("label", "")).strip()
+            if not src_raw or not tgt_raw or not label:
+                continue
+            src = dm.get(src_raw, src_raw)
+            tgt = dm.get(tgt_raw, tgt_raw)
+            if src not in known or tgt not in known or src == tgt:
+                continue
+            key = (min(src, tgt), max(src, tgt), label)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            all_rels.append({"source": src, "target": tgt, "label": label, "weight": 3.0})
+
+    logger.info("LLM extraction: %d relationships across %d windows",
+                len(all_rels), len(windows))
+    return all_rels
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Minimal component bridging — replaces hub-and-spoke fallback
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _connect_components(
+    relationships: list[dict],
+    all_nodes: set[str],
+    entity_freq: dict[str, int],
+) -> list[dict]:
+    """
+    Find disconnected components and add ONE bridge edge per component pair.
+    Picks the highest-importance node from each side as the bridge endpoint.
+    This keeps the graph navigable without creating a star topology.
+    """
+    # Build adjacency
+    adj: dict[str, set[str]] = defaultdict(set)
+    for r in relationships:
+        adj[r["source"]].add(r["target"])
+        adj[r["target"]].add(r["source"])
+    for n in all_nodes:
+        if n not in adj:
+            adj[n] = set()
+
+    # BFS component discovery
+    visited: set[str] = set()
+    components: list[list[str]] = []
+    for node in all_nodes:
+        if node in visited:
+            continue
+        comp: list[str] = []
+        q = [node]
+        while q:
+            n = q.pop()
+            if n in visited:
+                continue
+            visited.add(n)
+            comp.append(n)
+            q.extend(adj[n] - visited)
+        components.append(comp)
+
+    if len(components) <= 1:
+        logger.info("Graph fully connected: %d nodes, 1 component", len(all_nodes))
+        return relationships
+
+    logger.info("Graph has %d components — adding %d bridge edges",
+                len(components), len(components) - 1)
+
+    components.sort(key=len, reverse=True)
+    extra = list(relationships)
+    main_comp = set(components[0])
+
+    for comp in components[1:]:
+        # Score: degree + frequency
+        main_best = max(main_comp,
+                        key=lambda n: len(adj[n]) * 2 + entity_freq.get(n, 0))
+        comp_best = max(comp,
+                        key=lambda n: len(adj[n]) * 2 + entity_freq.get(n, 0))
+        extra.append({
+            "source": main_best,
+            "target": comp_best,
+            "label":  "related to",
+            "weight": 0.5,
+        })
+        main_comp.update(comp)
+
+    return extra
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Keyword fallback
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _keyword_fallback(text: str, existing: set[str], max_extra: int = 20) -> list[dict]:
+    extras: list[dict] = []
+    tl = text.lower()
+    for kw_set, cluster in [(_TECH_KW, "TECH"), (_CONCEPT_KW, "CONCEPT"), (_ACTION_KW, "ACTION")]:
+        for kw in kw_set:
+            if kw in tl and kw.lower() not in existing:
+                title = kw.title() if " " not in kw else kw.title()
+                extras.append({"text": title, "label": None, "_cluster": cluster})
+                existing.add(kw.lower())
+            if len(extras) >= max_extra:
+                return extras
+    return extras
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main extraction entry point
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_entities_and_relationships(text: str) -> dict:
+    text_sample = text[:60_000]
+    doc = nlp(text_sample)
+    doc_type = _detect_doc_type(text_sample)
+    logger.info("Doc type: %s", doc_type)
+
+    # ── Collect raw entities ───────────────────────────────────────────────────
+    raw_entities: list[dict] = []
+    seen: set[str] = set()
+
+    for ent in doc.ents:
+        cleaned = ent.text.replace("\n", " ").strip()
+        if len(cleaned) < 2 or re.fullmatch(r"[\d\s,.]+", cleaned):
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        raw_entities.append({"text": cleaned, "label": ent.label_})
+
+    for chunk in doc.noun_chunks:
+        cleaned = chunk.text.replace("\n", " ").strip()
+        if len(cleaned) < 3 or cleaned.lower() in seen:
+            continue
+        cl = _classify(cleaned, None)
+        if cl in ("TECH", "CONCEPT", "ACTION"):
+            seen.add(cleaned.lower())
+            raw_entities.append({"text": cleaned, "label": None})
+
+    if len(raw_entities) < 10:
+        logger.info("Sparse NER (%d), running keyword fallback", len(raw_entities))
+        for e in _keyword_fallback(text_sample, set(seen), 25):
+            raw_entities.append(e)
+            seen.add(e["text"].lower())
+
+    # ── Deduplicate ────────────────────────────────────────────────────────────
+    dm = _build_dedup_map(raw_entities)
+    raw_entities = _apply_dedup(raw_entities, dm)
+
+    # ── Frequency map ─────────────────────────────────────────────────────────
+    text_lower = text_sample.lower()
+    entity_freq: dict[str, int] = {
+        e["text"]: text_lower.count(e["text"].lower())
+        for e in raw_entities
+    }
+    known_set = {e["text"] for e in raw_entities}
+
+    # ── Layer 1: SVO ───────────────────────────────────────────────────────────
+    svo_rels = _svo_extract(doc, known_set, dm)
+
+    # ── Layer 2: Co-occurrence ─────────────────────────────────────────────────
+    cooc_rels = _cooccurrence_extract(doc, known_set, dm, min_cooccur=2)
+
+    # ── Layer 3: LLM extraction ────────────────────────────────────────────────
+    llm_rels = _llm_extract_all(text_sample, known_set, dm)
+
+    # ── Merge (LLM > SVO > co-occurrence) ────────────────────────────────────
+    merged_rels: list[dict] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    for r in llm_rels + svo_rels + cooc_rels:
+        src, tgt = r["source"], r["target"]
+        pair = (min(src, tgt), max(src, tgt))
+        if pair not in seen_pairs:
+            seen_pairs.add(pair)
+            merged_rels.append(r)
+
+    logger.info("Merged: %d total (LLM=%d SVO=%d cooc=%d)",
+                len(merged_rels), len(llm_rels), len(svo_rels), len(cooc_rels))
+
+    # ── Connect isolated components without hub-and-spoke ─────────────────────
+    merged_rels = _connect_components(merged_rels, known_set, entity_freq)
+
+    # ── Classify nodes into clusters ──────────────────────────────────────────
+    all_clusters: dict[str, list[dict]] = {k: [] for k in CLUSTERS}
+    node_to_cluster: dict[str, str] = {}
+
+    for ent in raw_entities:
+        eid = ent["text"]
+        cluster = ent.get("_cluster") or _classify(eid, ent.get("label"))
+        if cluster not in CLUSTERS:
+            cluster = "MISC"
+        if cluster == "QUANTITY" and ent.get("label") in ("CARDINAL", "ORDINAL"):
+            continue
+        if cluster == "DATE" and len(eid) < 3:
+            continue
+        if cluster == "MISC" and len(eid) < 4:
+            continue
+        existing = {n["id"].lower() for n in all_clusters[cluster]}
+        if eid.lower() in existing:
+            continue
+        all_clusters[cluster].append({"id": eid, "cluster": cluster})
+        node_to_cluster[eid] = cluster
+
+    filled_clusters = {k: v for k, v in all_clusters.items() if v}
+
+    # ── Pick center = highest degree + frequency node ─────────────────────────
+    degree: dict[str, int] = defaultdict(int)
+    for r in merged_rels:
+        degree[r["source"]] += 1
+        degree[r["target"]] += 1
+
+    score = {n: degree.get(n, 0) * 2 + entity_freq.get(n, 0) for n in known_set}
+    center_id = max(score, key=score.get) if score else (
+        raw_entities[0]["text"] if raw_entities else "Document"
+    )
+
+    logger.info(
+        "Graph [%s]: center='%s' (degree=%d), nodes=%d, edges=%d",
+        doc_type, center_id, degree.get(center_id, 0),
+        len(raw_entities), len(merged_rels),
+    )
+
+    return {
+        "doc_type":      doc_type,
+        "center":        {"id": center_id, "label": "ENTITY", "cluster": "CENTER"},
+        "clusters":      filled_clusters,
+        "relationships": merged_rels,
+        "entities":      [{"text": e["text"], "label": e.get("label", "")} for e in raw_entities],
+        "_dedup_map":    dm,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Chunk-to-entity linking
 # ══════════════════════════════════════════════════════════════════════════════
 
 def link_entities_to_chunks(
@@ -267,386 +638,35 @@ def link_entities_to_chunks(
     entities: list[dict],
     dedup_map: dict[str, str] | None = None,
 ) -> list[dict]:
-    """
-    Tag each chunk with the canonical entity IDs it contains.
-
-    Modifies chunks in-place (adds "entities" key) and returns them.
-
-    This enables genuine hybrid filtering at query time:
-        relevant_chunks = [c for c in chunks
-                           if any(e in seed_entities for e in c["entities"])]
-
-    Parameters
-    ----------
-    chunks    : list of chunk dicts (must have "content" key)
-    entities  : list of entity dicts (must have "text" key)
-    dedup_map : optional deduplication map from _build_dedup_map()
-    """
+    """Tag each chunk with canonical entity IDs it contains."""
     if dedup_map is None:
         dedup_map = {}
-
-    # Build canonical entity list (normalised to lower for matching)
-    canonical_entities: list[str] = []
-    seen_canon: set[str] = set()
+    canonical: list[str] = []
+    seen: set[str] = set()
     for e in entities:
-        canon = dedup_map.get(e["text"], e["text"])
-        if canon not in seen_canon:
-            seen_canon.add(canon)
-            canonical_entities.append(canon)
+        c = dedup_map.get(e["text"], e["text"])
+        if c not in seen:
+            seen.add(c)
+            canonical.append(c)
 
     for chunk in chunks:
-        content_lower = chunk.get("content", "").lower()
-        found: list[str] = []
-        for entity in canonical_entities:
-            if entity.lower() in content_lower:
-                found.append(entity)
-        chunk["entities"] = found
+        cl = chunk.get("content", "").lower()
+        chunk["entities"] = [e for e in canonical if e.lower() in cl]
 
-    linked_count = sum(len(c.get("entities", [])) for c in chunks)
-    logger.info(
-        "Chunk-entity linking: %d chunks, %d entities, %d total links",
-        len(chunks), len(canonical_entities), linked_count,
-    )
+    total = sum(len(c.get("entities", [])) for c in chunks)
+    logger.info("Chunk-entity links: %d chunks → %d total", len(chunks), total)
     return chunks
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Existing helpers (unchanged)
+# Storage
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _classify_entity(text: str, spacy_label: str | None) -> str:
-    stripped = text.strip()
-    if not stripped or len(stripped) < 2:
-        return "MISC"
-    if re.fullmatch(r"[\d,.\s%$€£¥]+", stripped):
-        return "QUANTITY"
-
-    if spacy_label and spacy_label in _SPACY_TO_CLUSTER:
-        base = _SPACY_TO_CLUSTER[spacy_label]
-        if base == "ENTITY" and stripped.lower() in _TECH_KEYWORDS:
-            return "TECH"
-        return base
-
-    lower = stripped.lower()
-    if any(kw in lower for kw in _TECH_KEYWORDS):
-        return "TECH"
-    if any(kw in lower for kw in _CONCEPT_KEYWORDS):
-        return "CONCEPT"
-    if any(kw in lower for kw in _ACTION_KEYWORDS):
-        return "ACTION"
-
-    return "MISC"
-
-
-def _detect_doc_type(text: str) -> str:
-    lower = text[:3000].lower()
-    signals = {
-        "resume": ["experience", "education", "skills", "objective",
-                   "curriculum vitae", "cv", "references", "work history"],
-        "research": ["abstract", "introduction", "methodology", "conclusion",
-                     "hypothesis", "findings", "literature review", "dataset"],
-        "news": ["reported", "according to", "announced", "breaking",
-                 "journalist", "correspondent", "update"],
-        "legal": ["whereas", "hereinafter", "plaintiff", "defendant",
-                  "pursuant", "jurisdiction", "clause", "agreement", "contract"],
-        "technical": ["installation", "configuration", "api", "endpoint",
-                      "function", "parameter", "documentation", "version"],
-        "financial": ["revenue", "profit", "ebitda", "fiscal", "quarter",
-                      "annual report", "balance sheet", "cash flow"],
-    }
-    scores = {dtype: sum(1 for kw in kws if kw in lower)
-              for dtype, kws in signals.items()}
-    best = max(scores, key=scores.get)
-    return best if scores[best] >= 2 else "general"
-
-
-def _pick_center(text: str, entities: list[dict], doc_type: str) -> dict | None:
-    if not entities:
-        return None
-
-    text_lower = text.lower()
-    freq = {e["text"]: text_lower.count(e["text"].lower()) for e in entities}
-
-    def most_frequent(label_filter=None):
-        filtered = [e for e in entities
-                    if label_filter is None or e.get("label") == label_filter]
-        return max(filtered, key=lambda e: freq.get(e["text"], 0)) if filtered else None
-
-    if doc_type == "resume":
-        return most_frequent("PERSON") or entities[0]
-    if doc_type == "research":
-        non_date = [e for e in entities
-                    if e.get("label") not in ("DATE", "TIME", "CARDINAL", "ORDINAL")]
-        return max(non_date, key=lambda e: freq.get(e["text"], 0)) if non_date else entities[0]
-    if doc_type == "news":
-        return most_frequent("PERSON") or most_frequent("ORG") or entities[0]
-    if doc_type == "legal":
-        return most_frequent("ORG") or most_frequent("LAW") or entities[0]
-    if doc_type == "technical":
-        return most_frequent("PRODUCT") or most_frequent("ORG") or entities[0]
-    if doc_type == "financial":
-        return most_frequent("ORG") or entities[0]
-
-    return max(entities, key=lambda e: freq.get(e["text"], 0))
-
-
-def _type_relation(verb: str, src_cluster: str, tgt_cluster: str) -> str:
-    v = verb.lower().strip()
-    verb_map = {
-        "develop": "developed", "build": "built", "create": "created",
-        "design": "designed", "implement": "implemented",
-        "use": "uses", "apply": "applies",
-        "work": "worked at", "found": "founded",
-        "lead": "leads", "manage": "manages", "direct": "directs",
-        "head": "heads", "join": "joined",
-        "publish": "published", "write": "authored", "author": "authored",
-        "research": "researched", "study": "studied",
-        "analyze": "analyzed", "propose": "proposed",
-        "introduce": "introduced", "describe": "describes",
-        "define": "defines", "include": "includes",
-        "contain": "contains", "support": "supports",
-        "enable": "enables", "allow": "allows",
-        "require": "requires", "provide": "provides",
-        "show": "shows", "demonstrate": "demonstrates",
-        "compare": "compared", "evaluate": "evaluated",
-        "improve": "improves", "increase": "increases",
-        "decrease": "decreases", "reduce": "reduces",
-        "affect": "affects", "impact": "impacts",
-        "cause": "causes", "result": "results in",
-        "base": "based on", "depend": "depends on",
-        "integrate": "integrates with",
-        "collaborate": "collaborates with",
-        "partner": "partners with",
-        "acquire": "acquired", "merge": "merged with",
-        "invest": "invested in", "fund": "funded by",
-        "release": "released", "launch": "launched",
-        "deploy": "deployed", "announce": "announced",
-        "report": "reported by", "sign": "signed",
-        "approve": "approved", "reject": "rejected",
-        "regulate": "regulated by",
-    }
-    if v in verb_map:
-        return verb_map[v]
-
-    pair_map = {
-        ("ENTITY", "LOCATION"):  "located in",
-        ("ENTITY", "ENTITY"):    "associated with",
-        ("ENTITY", "CONCEPT"):   "related to",
-        ("ENTITY", "TECH"):      "uses",
-        ("ENTITY", "EVENT"):     "participated in",
-        ("ENTITY", "DATE"):      "active in",
-        ("CONCEPT", "CONCEPT"):  "related to",
-        ("CONCEPT", "TECH"):     "implemented via",
-        ("TECH", "TECH"):        "integrates with",
-        ("ACTION", "ENTITY"):    "involves",
-        ("ACTION", "CONCEPT"):   "applies to",
-    }
-    result = pair_map.get((src_cluster, tgt_cluster))
-    if result:
-        return result
-    return v if v else "related to"
-
-
-def _keyword_fallback(text: str, existing_ids: set[str], max_extra: int = 20) -> list[dict]:
-    extras: list[dict] = []
-    text_lower = text.lower()
-    for kw_set, cluster in [(_TECH_KEYWORDS, "TECH"), (_CONCEPT_KEYWORDS, "CONCEPT"), (_ACTION_KEYWORDS, "ACTION")]:
-        for kw in kw_set:
-            if kw in text_lower and kw.lower() not in existing_ids:
-                extras.append({"text": kw.title() if " " not in kw else kw.title(), "label": None, "_cluster": cluster})
-                existing_ids.add(kw.lower())
-            if len(extras) >= max_extra:
-                break
-        if len(extras) >= max_extra:
-            break
-    return extras
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Core extraction — updated to use deduplication
-# ══════════════════════════════════════════════════════════════════════════════
-
-def extract_entities_and_relationships(text: str) -> dict:
-    text_sample = text[:60_000]
-    doc = nlp(text_sample)
-
-    doc_type = _detect_doc_type(text_sample)
-    logger.info("Detected document type: %s", doc_type)
-
-    # 1. Named entities
-    raw_entities: list[dict] = []
-    seen: set[str] = set()
-
-    for ent in doc.ents:
-        cleaned = ent.text.replace("\n", " ").strip()
-        if len(cleaned) < 2:
-            continue
-        key = cleaned.lower()
-        if key in seen:
-            continue
-        if re.fullmatch(r"[\d\s,.]+", cleaned):
-            continue
-        seen.add(key)
-        raw_entities.append({"text": cleaned, "label": ent.label_})
-
-    # 2. Noun chunks
-    for chunk in doc.noun_chunks:
-        cleaned = chunk.text.replace("\n", " ").strip()
-        if len(cleaned) < 3 or cleaned.lower() in seen:
-            continue
-        cluster = _classify_entity(cleaned, None)
-        if cluster in ("TECH", "CONCEPT", "ACTION"):
-            seen.add(cleaned.lower())
-            raw_entities.append({"text": cleaned, "label": None})
-
-    # 3. Keyword fallback
-    if len(raw_entities) < 10:
-        logger.info("Sparse NER (%d), running keyword fallback", len(raw_entities))
-        extras = _keyword_fallback(text_sample, set(seen), max_extra=25)
-        for e in extras:
-            raw_entities.append({"text": e["text"], "label": e.get("label"), "_cluster": e.get("_cluster")})
-            seen.add(e["text"].lower())
-
-    # ── NEW: Deduplicate entities ─────────────────────────────────────────────
-    dedup_map = _build_dedup_map(raw_entities, threshold=82)
-    raw_entities = _apply_dedup(raw_entities, dedup_map)
-    logger.info("After deduplication: %d entities", len(raw_entities))
-
-    # 4. Pick center node
-    center_raw = _pick_center(text_sample, raw_entities, doc_type)
-    center_id = center_raw["text"] if center_raw else "Document"
-
-    # 5. Classify into clusters
-    all_clusters: dict[str, list[dict]] = {k: [] for k in CLUSTERS}
-    node_to_cluster: dict[str, str] = {}
-
-    for ent in raw_entities:
-        eid = ent["text"]
-        if eid == center_id:
-            continue
-        if ent.get("_cluster"):
-            cluster = ent["_cluster"]
-        else:
-            cluster = _classify_entity(eid, ent.get("label"))
-
-        if cluster == "QUANTITY" and ent.get("label") in ("CARDINAL", "ORDINAL"):
-            continue
-        if cluster == "DATE" and len(eid) < 3:
-            continue
-        if cluster == "MISC" and len(eid) < 4:
-            continue
-        if cluster not in all_clusters:
-            cluster = "MISC"
-
-        existing = {n["id"].lower() for n in all_clusters[cluster]}
-        if eid.lower() in existing:
-            continue
-
-        all_clusters[cluster].append({"id": eid, "cluster": cluster})
-        node_to_cluster[eid] = cluster
-
-    filled_clusters = {k: v for k, v in all_clusters.items() if v}
-
-    # 6. SVO relationships
-    relationships: list[dict] = []
-    seen_rels: set[tuple] = set()
-
-    _SUBJ_DEPS = {"nsubj", "nsubjpass", "csubj"}
-    _OBJ_DEPS  = {"dobj", "attr", "pobj", "acomp", "oprd", "xcomp", "dative"}
-
-    for token in doc:
-        if token.pos_ != "VERB":
-            continue
-        subjects = [c for c in token.children if c.dep_ in _SUBJ_DEPS]
-        objects  = [c for c in token.children if c.dep_ in _OBJ_DEPS]
-        for child in token.children:
-            if child.dep_ == "prep":
-                for pobj in child.children:
-                    if pobj.dep_ in ("pobj", "pcomp"):
-                        objects.append(pobj)
-
-        for subj in subjects:
-            for obj in objects:
-                # Apply dedup map to raw token text before matching
-                src_raw = subj.text.strip()
-                tgt_raw = obj.text.strip()
-                src = dedup_map.get(src_raw, src_raw)
-                tgt = dedup_map.get(tgt_raw, tgt_raw)
-                verb = token.lemma_.lower()
-
-                if len(src) < 2 or len(tgt) < 2 or src == tgt:
-                    continue
-                if (src, verb, tgt) in seen_rels:
-                    continue
-
-                src_known = (src == center_id) or (src in node_to_cluster)
-                tgt_known = (tgt == center_id) or (tgt in node_to_cluster)
-                if not (src_known and tgt_known):
-                    continue
-
-                seen_rels.add((src, verb, tgt))
-                src_cluster = node_to_cluster.get(src, "ENTITY")
-                tgt_cluster = node_to_cluster.get(tgt, "ENTITY")
-                label = _type_relation(verb, src_cluster, tgt_cluster)
-                relationships.append({"source": src, "target": tgt, "label": label})
-
-    # ── NEW: Remap relationships through dedup map ────────────────────────────
-    relationships = _remap_relationships(relationships, dedup_map)
-
-    # 7. Connect orphan nodes to center
-    connected_nodes = (
-        {r["source"] for r in relationships} | {r["target"] for r in relationships}
-    )
-    center_edge_labels = {
-        "ENTITY": "includes", "CONCEPT": "covers", "LOCATION": "located in",
-        "EVENT": "involves", "DATE": "dated", "ACTION": "describes",
-        "QUANTITY": "quantifies", "RELATION": "relates to",
-        "TECH": "uses", "MISC": "mentions",
-    }
-    for cluster_name, nodes in filled_clusters.items():
-        for node in nodes:
-            nid = node["id"]
-            if nid not in connected_nodes:
-                relationships.append({
-                    "source": center_id,
-                    "target": nid,
-                    "label": center_edge_labels.get(cluster_name, "related to"),
-                })
-
-    graph_data = {
-        "doc_type":      doc_type,
-        "center":        {
-            "id":      center_id,
-            "label":   center_raw.get("label", "ENTITY") if center_raw else "ENTITY",
-            "cluster": "CENTER",
-        },
-        "clusters":      filled_clusters,
-        "relationships": relationships,
-        "entities":      [{"text": e["text"], "label": e.get("label", "")} for e in raw_entities],
-        # ── NEW: expose dedup_map so upload.py can pass it to chunk linker ──
-        "_dedup_map":    dedup_map,
-    }
-
-    logger.info(
-        "Graph [%s]: center='%s', clusters=%d, nodes=%d, edges=%d, dedup_merges=%d",
-        doc_type, center_id,
-        len(filled_clusters),
-        sum(len(v) for v in filled_clusters.values()),
-        len(relationships),
-        len(dedup_map),
-    )
-    return graph_data
-
-
-# ── Storage ────────────────────────────────────────────────────────────────────
 def store_knowledge_graph(data: dict) -> None:
     _knowledge_graph.append(data)
-    logger.debug("Knowledge graph updated (segments: %d)", len(_knowledge_graph))
-
 
 def get_knowledge_graph() -> list[dict]:
     return _knowledge_graph
-
 
 def clear_knowledge_graph() -> None:
     _knowledge_graph.clear()
