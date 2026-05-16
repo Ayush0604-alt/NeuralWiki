@@ -3,38 +3,54 @@ import * as d3 from "d3";
 
 const API = "http://127.0.0.1:8000";
 
+// ── Cluster config — used for SHAPE/ICON only, color is now community-based ──
 const CLUSTER_CONFIG = {
-  CENTER:   { color: "#8b84ff", bg: "#8b84ff18", icon: "◉", label: "Center",       size: 20 },
-  ENTITY:   { color: "#8b84ff", bg: "#8b84ff14", icon: "◉", label: "Entities",     size: 11 },
-  CONCEPT:  { color: "#1fc791", bg: "#1fc79114", icon: "◈", label: "Concepts",     size: 11 },
-  LOCATION: { color: "#e05252", bg: "#e0525214", icon: "◎", label: "Locations",    size: 11 },
-  EVENT:    { color: "#ff9f43", bg: "#ff9f4314", icon: "◆", label: "Events",       size: 10 },
-  DATE:     { color: "#00d2d3", bg: "#00d2d314", icon: "◇", label: "Dates",        size: 9  },
-  ACTION:   { color: "#c47aff", bg: "#c47aff14", icon: "▶", label: "Actions",      size: 10 },
-  QUANTITY: { color: "#54a0ff", bg: "#54a0ff14", icon: "▣", label: "Quantities",   size: 9  },
-  TECH:     { color: "#47bfff", bg: "#47bfff14", icon: "⬡", label: "Technologies", size: 12 },
-  MISC:     { color: "#6b6b80", bg: "#6b6b8014", icon: "·", label: "Other",        size: 8  },
+  CENTER:   { icon: "◉", label: "Center",       baseSize: 20 },
+  ENTITY:   { icon: "◉", label: "Entities",     baseSize: 10 },
+  CONCEPT:  { icon: "◈", label: "Concepts",     baseSize: 10 },
+  LOCATION: { icon: "◎", label: "Locations",    baseSize: 10 },
+  EVENT:    { icon: "◆", label: "Events",        baseSize: 9  },
+  DATE:     { icon: "◇", label: "Dates",         baseSize: 8  },
+  ACTION:   { icon: "▶", label: "Actions",       baseSize: 9  },
+  QUANTITY: { icon: "▣", label: "Quantities",    baseSize: 8  },
+  TECH:     { icon: "⬡", label: "Technologies",  baseSize: 10 },
+  MISC:     { icon: "·", label: "Other",          baseSize: 7  },
 };
+
+// 12-color categorical palette for communities
+const COMMUNITY_PALETTE = [
+  "#8b84ff", "#1fc791", "#ff9f43", "#e05252",
+  "#47bfff", "#c47aff", "#00d2d3", "#54a0ff",
+  "#f368e0", "#ffd32a", "#0be881", "#ff4d4d",
+];
+
+function communityColor(communityId) {
+  return COMMUNITY_PALETTE[communityId % COMMUNITY_PALETTE.length];
+}
 
 const cfg = (cluster) => CLUSTER_CONFIG[cluster] || CLUSTER_CONFIG.MISC;
 
-// Edge label colours by relationship type
+// Node radius: degree-driven so genuine hubs are visually prominent
+function nodeRadius(degree, isCenter) {
+  if (isCenter) return Math.max(16, Math.sqrt(degree + 1) * 6);
+  return Math.max(6, Math.sqrt(degree + 1) * 3.5);
+}
+
 const EDGE_COLORS = {
-  "co-occurs with":     "#ffffff18",
-  "related to":         "#ffffff22",
-  "associated with":    "#ffffff22",
-  "integrates with":    "#47bfff55",
-  "uses":               "#47bfff44",
-  "is part of":         "#1fc79144",
-  "depends on":         "#f5a62344",
-  "outperforms":        "#e0525244",
-  "causes":             "#ff9f4344",
-  "is type of":         "#c47aff44",
-  "based on":           "#8b84ff44",
-  "derived from":       "#8b84ff33",
-  "enables":            "#1fc79133",
-  "contradicts":        "#e0525255",
-  "collaborated with":  "#54a0ff44",
+  "co-occurs with":  "#ffffff18",
+  "related to":      "#ffffff22",
+  "associated with": "#ffffff22",
+  "integrates with": "#47bfff55",
+  "uses":            "#47bfff44",
+  "is part of":      "#1fc79144",
+  "depends on":      "#f5a62344",
+  "outperforms":     "#e0525244",
+  "causes":          "#ff9f4344",
+  "is type of":      "#c47aff44",
+  "based on":        "#8b84ff44",
+  "derived from":    "#8b84ff33",
+  "enables":         "#1fc79133",
+  "contradicts":     "#e0525255",
 };
 
 function edgeColor(label) {
@@ -48,73 +64,81 @@ function edgeColor(label) {
 
 function edgeWidth(weight) {
   if (!weight) return 0.8;
-  if (weight >= 3) return 2.2;   // LLM-extracted
-  if (weight >= 2) return 1.5;   // SVO
-  if (weight >= 1) return 1.0;   // co-occurrence
-  return 0.6;                     // bridge edges (weight 0.5)
+  if (weight >= 3) return 2.2;
+  if (weight >= 2) return 1.5;
+  if (weight >= 1) return 1.0;
+  return 0.5;
 }
 
-// ── Build flat graph from multi-doc API response ──────────────────────────────
-function buildGraph(rawArray) {
-  if (!rawArray?.length) return { nodes: [], links: [] };
+// ── Parse flat + legacy formats from API ──────────────────────────────────────
+function parseGraphResponse(rawArray) {
+  if (!rawArray?.length) return { nodes: [], links: [], numCommunities: 0 };
 
+  // Prefer flat format (last entry with _flat: true)
+  const flatEntry = rawArray.find(e => e._flat);
+  if (flatEntry) {
+    return {
+      nodes: flatEntry.nodes || [],
+      links: flatEntry.links || [],
+      numCommunities: flatEntry.num_communities || 0,
+    };
+  }
+
+  // Fallback: reconstruct from legacy document-segmented format
   const nodeMap = new Map();
-  const linkMap = new Map(); // key → link (deduplicate)
+  const linkMap = new Map();
 
   rawArray.forEach((seg, segIdx) => {
-    if (!seg) return;
+    if (!seg || seg._flat) return;
     const centerId = seg.center?.id || `Document_${segIdx}`;
 
-    // Center node
     if (!nodeMap.has(centerId)) {
       nodeMap.set(centerId, {
-        id: centerId, cluster: "CENTER",
-        r: rawArray.length > 1 ? 16 : 20,
-        segIdx, docCenter: true,
+        id: centerId, cluster: "CENTER", community_id: segIdx,
+        degree: 0, freq: 1, doc_ids: [], is_center: true,
       });
     }
 
-    // Cluster nodes
     for (const [clusterName, nodes] of Object.entries(seg.clusters || {})) {
       for (const node of (nodes || [])) {
         if (!node.id || nodeMap.has(node.id)) continue;
         nodeMap.set(node.id, {
-          id: node.id, cluster: clusterName,
-          r: cfg(clusterName).size || 10,
-          segIdx,
+          id: node.id, cluster: clusterName, community_id: segIdx,
+          degree: 0, freq: 1, doc_ids: [], is_center: false,
         });
       }
     }
 
-    // Relationships — preserve weight and label
     for (const rel of (seg.relationships || [])) {
-      const src = rel.source;
-      const tgt = rel.target;
-      if (!nodeMap.has(src) || !nodeMap.has(tgt)) continue;
-      // Use undirected key for dedup — keep highest-weight version
-      const key = [src, tgt].sort().join("|||");
+      if (!nodeMap.has(rel.source) || !nodeMap.has(rel.target)) continue;
+      const key = [rel.source, rel.target].sort().join("|||");
       const existing = linkMap.get(key);
       const weight = rel.weight || 1;
       if (!existing || weight > (existing.weight || 1)) {
-        linkMap.set(key, {
-          source: src, target: tgt,
-          label: rel.label || "",
-          weight,
-          segIdx,
-        });
+        linkMap.set(key, { source: rel.source, target: rel.target, label: rel.label || "", weight });
       }
     }
   });
 
+  // Compute degree
+  for (const link of linkMap.values()) {
+    const s = nodeMap.get(link.source);
+    const t = nodeMap.get(link.target);
+    if (s) s.degree++;
+    if (t) t.degree++;
+  }
+
   return {
     nodes: [...nodeMap.values()],
     links: [...linkMap.values()],
+    numCommunities: rawArray.filter(e => !e._flat).length,
   };
 }
 
 // ── Tooltip ───────────────────────────────────────────────────────────────────
 function Tooltip({ node, x, y, links }) {
   if (!node) return null;
+  const color = communityColor(node.community_id || 0);
   const c = cfg(node.cluster);
   const conns = links.filter(l => {
     const s = typeof l.source === "object" ? l.source.id : l.source;
@@ -127,22 +151,22 @@ function Tooltip({ node, x, y, links }) {
   return (
     <div style={{
       position: "fixed", left, top, zIndex: 200, pointerEvents: "none",
-      background: "var(--bg-surface)", border: `1px solid ${c.color}55`,
+      background: "var(--bg-surface)", border: `1px solid ${color}55`,
       borderRadius: 12, padding: "14px 16px", minWidth: 210, maxWidth: 290,
-      boxShadow: `0 16px 40px rgba(0,0,0,0.5), 0 0 0 1px ${c.color}20`,
+      boxShadow: `0 16px 40px rgba(0,0,0,0.5), 0 0 0 1px ${color}20`,
     }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
         <div style={{
           width: 32, height: 32, borderRadius: "50%", flexShrink: 0,
-          background: c.bg, border: `1.5px solid ${c.color}`,
+          background: color + "22", border: `1.5px solid ${color}`,
           display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14,
         }}>{c.icon}</div>
         <div>
-          <div style={{ fontSize: 13, fontWeight: 600, color: c.color, lineHeight: 1.3 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color, lineHeight: 1.3 }}>
             {node.id.length > 28 ? node.id.slice(0, 27) + "…" : node.id}
           </div>
-          <div style={{ fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.7px" }}>
-            {c.label} · {conns.length} connection{conns.length !== 1 ? "s" : ""}
+          <div style={{ fontSize: 10, color: "var(--text-muted)", letterSpacing: "0.7px" }}>
+            {c.label} · community {node.community_id} · degree {node.degree}
           </div>
         </div>
       </div>
@@ -153,58 +177,43 @@ function Tooltip({ node, x, y, links }) {
         const arrow = s === node.id ? "→" : "←";
         return (
           <div key={i} style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>
-            <span style={{ color: c.color, fontWeight: 700, flexShrink: 0 }}>{arrow}</span>
-            <span style={{
-              background: "var(--bg-raised)", border: "1px solid var(--border)",
-              borderRadius: 3, padding: "0 5px", fontSize: 10,
-              color: edgeColor(l.label) === "#ffffff18" ? "var(--text-muted)" : "#ccc",
-              flexShrink: 0, maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-            }}>{l.label || "—"}</span>
+            <span style={{ color, fontWeight: 700, flexShrink: 0 }}>{arrow}</span>
+            <span style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", borderRadius: 3, padding: "0 5px", fontSize: 10, color: "#ccc", flexShrink: 0, maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {l.label || "—"}
+            </span>
             <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {other.length > 20 ? other.slice(0, 19) + "…" : other}
             </span>
           </div>
         );
       })}
-      {conns.length > 5 && (
-        <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 2 }}>
-          +{conns.length - 5} more connections
-        </div>
-      )}
+      {conns.length > 5 && <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 2 }}>+{conns.length - 5} more</div>}
     </div>
   );
 }
 
-// ── Filter legend ─────────────────────────────────────────────────────────────
-function Legend({ clusters, activeFilters, onToggle, counts }) {
+// ── Cluster filter legend ─────────────────────────────────────────────────────
+function ClusterLegend({ clusters, activeFilters, onToggle, counts }) {
   if (!clusters.length) return null;
   return (
-    <div style={{
-      position: "absolute", top: 14, right: 14,
-      display: "flex", flexDirection: "column", gap: 4, zIndex: 10,
-    }}>
-      <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 2, paddingLeft: 2,
-        letterSpacing: "0.5px", textTransform: "uppercase" }}>Filter</div>
+    <div style={{ position: "absolute", top: 14, right: 14, display: "flex", flexDirection: "column", gap: 4, zIndex: 10 }}>
+      <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 2, paddingLeft: 2, letterSpacing: "0.5px", textTransform: "uppercase" }}>Filter by type</div>
       {clusters.map(c => {
         const cl = cfg(c);
         const on = activeFilters.has(c);
         return (
           <button key={c} onClick={() => onToggle(c)} style={{
             display: "flex", alignItems: "center", gap: 7,
-            background: on ? cl.bg : "var(--bg-surface)",
-            border: `1px solid ${on ? cl.color + "55" : "var(--border)"}`,
-            borderRadius: 999, padding: "4px 10px 4px 7px",
-            fontSize: 11, cursor: "pointer", transition: "all 120ms",
-            opacity: on ? 1 : 0.4,
+            background: on ? "var(--bg-raised)" : "var(--bg-surface)",
+            border: `1px solid ${on ? "var(--border-focus)" : "var(--border)"}`,
+            borderRadius: 999, padding: "4px 10px 4px 7px", fontSize: 11,
+            cursor: "pointer", transition: "all 120ms", opacity: on ? 1 : 0.4,
           }}>
-            <div style={{ width: 7, height: 7, borderRadius: "50%", background: cl.color, flexShrink: 0 }} />
-            <span style={{ color: on ? cl.color : "var(--text-secondary)" }}>{cl.label}</span>
-            <span style={{
-              marginLeft: 2, borderRadius: 999, padding: "1px 5px",
-              background: on ? cl.color + "22" : "var(--bg-raised)",
-              color: on ? cl.color : "var(--text-muted)",
-              fontSize: 10, fontFamily: "var(--font-mono)",
-            }}>{counts[c] || 0}</span>
+            <span style={{ fontSize: 10 }}>{cl.icon}</span>
+            <span style={{ color: on ? "var(--text-primary)" : "var(--text-secondary)" }}>{cl.label}</span>
+            <span style={{ marginLeft: 2, borderRadius: 999, padding: "1px 5px", background: on ? "var(--accent-dim)" : "var(--bg-raised)", color: on ? "var(--accent-light)" : "var(--text-muted)", fontSize: 10, fontFamily: "var(--font-mono)" }}>
+              {counts[c] || 0}
+            </span>
           </button>
         );
       })}
@@ -213,20 +222,24 @@ function Legend({ clusters, activeFilters, onToggle, counts }) {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
-export default function KnowledgeGraph() {
-  const [rawGraph, setRawGraph]   = useState([]);
-  const [graphData, setGraphData] = useState({ nodes: [], links: [] });
-  const [loading, setLoading]     = useState(false);
-  const [error, setError]         = useState("");
-  const [tooltip, setTooltip]     = useState(null);
-  const [searchQ, setSearchQ]     = useState("");
+export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
+  const [rawArray, setRawArray]     = useState([]);
+  const [graphData, setGraphData]   = useState({ nodes: [], links: [], numCommunities: 0 });
+  const [loading, setLoading]       = useState(false);
+  const [error, setError]           = useState("");
+  const [tooltip, setTooltip]       = useState(null);
+  const [searchQ, setSearchQ]       = useState("");
   const [activeFilters, setActiveFilters] = useState(new Set());
-  const [edgeMode, setEdgeMode]   = useState("all"); // all | strong | semantic
+  const [edgeMode, setEdgeMode]     = useState("all");
 
   const svgRef  = useRef(null);
   const wrapRef = useRef(null);
   const simRef  = useRef(null);
   const zoomRef = useRef(null);
+  // nodeElRef and linkElRef hold D3 selections so filter/search can update
+  // opacity without restarting the simulation
+  const nodeElRef = useRef(null);
+  const linkElRef = useRef(null);
   const [dims, setDims] = useState({ w: 900, h: 600 });
 
   useEffect(() => {
@@ -246,29 +259,33 @@ export default function KnowledgeGraph() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (!Array.isArray(data.graph)) throw new Error("Invalid format");
-      setRawGraph(data.graph);
+      setRawArray(data.graph);
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
   }, []);
 
   useEffect(() => { fetchGraph(); }, [fetchGraph]);
 
+  // Auto-refresh when a document is uploaded or deleted
   useEffect(() => {
-    const g = buildGraph(rawGraph);
-    setGraphData(g);
-    const clusters = [...new Set(g.nodes.map(n => n.cluster))].filter(c => c !== "CENTER");
+    const unsubs = [];
+    if (onDocumentAdded)   unsubs.push(onDocumentAdded(fetchGraph));
+    if (onDocumentRemoved) unsubs.push(onDocumentRemoved(fetchGraph));
+    return () => unsubs.forEach(u => u?.());
+  }, [onDocumentAdded, onDocumentRemoved, fetchGraph]);
+
+  useEffect(() => {
+    const parsed = parseGraphResponse(rawArray);
+    setGraphData(parsed);
+    const clusters = [...new Set(parsed.nodes.map(n => n.cluster))].filter(c => c !== "CENTER");
     setActiveFilters(new Set(clusters));
-  }, [rawGraph]);
+  }, [rawArray]);
 
-  // Edge weight filter
-  const filterWeight = edgeMode === "strong"   ? 2.0
-                     : edgeMode === "semantic"  ? 2.5
-                     : 0;
+  // ── Visible subsets ──────────────────────────────────────────────────────
+  const filterWeight = edgeMode === "strong" ? 2.0 : edgeMode === "semantic" ? 2.5 : 0;
 
-  const visible = useCallback(() => {
-    const nodes = graphData.nodes.filter(n =>
-      n.cluster === "CENTER" || activeFilters.has(n.cluster)
-    );
+  const getVisible = useCallback(() => {
+    const nodes = graphData.nodes.filter(n => n.is_center || activeFilters.has(n.cluster));
     const ids = new Set(nodes.map(n => n.id));
     const links = graphData.links.filter(l => {
       const s = typeof l.source === "object" ? l.source.id : l.source;
@@ -278,29 +295,51 @@ export default function KnowledgeGraph() {
     return { nodes, links };
   }, [graphData, activeFilters, filterWeight]);
 
-  const matchIds = useCallback(() => {
+  const getMatchIds = useCallback(() => {
     if (!searchQ.trim()) return new Set();
     const q = searchQ.toLowerCase();
     return new Set(graphData.nodes.filter(n => n.id.toLowerCase().includes(q)).map(n => n.id));
   }, [graphData, searchQ]);
 
-  // ── D3 render ────────────────────────────────────────────────────────────
+  // ── Update visual opacity without restarting simulation ───────────────────
+  // This runs when filters/search change but graphData is the same
+  useEffect(() => {
+    if (!nodeElRef.current || !linkElRef.current) return;
+    const { nodes: visNodes, links: visLinks } = getVisible();
+    const visIds = new Set(visNodes.map(n => n.id));
+    const matches = getMatchIds();
+
+    nodeElRef.current
+      .attr("display", d => visIds.has(d.id) ? null : "none")
+      .attr("opacity", d => {
+        if (!visIds.has(d.id)) return 0;
+        if (matches.size > 0) return (matches.has(d.id) || d.is_center) ? 1 : 0.08;
+        return 1;
+      });
+
+    linkElRef.current.attr("display", l => {
+      const s = typeof l.source === "object" ? l.source.id : l.source;
+      const t = typeof l.target === "object" ? l.target.id : l.target;
+      const w = l.weight || 1;
+      return (visIds.has(s) && visIds.has(t) && w >= filterWeight) ? null : "none";
+    });
+  }, [activeFilters, edgeMode, searchQ, getVisible, getMatchIds, filterWeight]);
+
+  // ── Full D3 simulation — only re-runs when graphData or dims change ───────
   useEffect(() => {
     if (!svgRef.current) return;
-    const { nodes, links } = visible();
+    const { nodes, links } = getVisible();
     if (!nodes.length) return;
     const { w, h } = dims;
+
     const svg = d3.select(svgRef.current);
     svg.selectAll("*").remove();
+    nodeElRef.current = null;
+    linkElRef.current = null;
 
-    const matches = matchIds();
-    const centerNodes = nodes.filter(n => n.cluster === "CENTER");
-    const isMulti = centerNodes.length > 1;
-
-    // Defs
     const defs = svg.append("defs");
 
-    // Glow
+    // Glow filter for high-degree nodes
     const glow = defs.append("filter").attr("id", "glow")
       .attr("x", "-50%").attr("y", "-50%").attr("width", "200%").attr("height", "200%");
     glow.append("feGaussianBlur").attr("stdDeviation", "3").attr("result", "blur");
@@ -308,13 +347,14 @@ export default function KnowledgeGraph() {
     merge.append("feMergeNode").attr("in", "blur");
     merge.append("feMergeNode").attr("in", "SourceGraphic");
 
-    // Arrows per cluster
-    [...new Set(nodes.map(n => n.cluster))].forEach(cluster => {
-      const color = cfg(cluster).color;
-      defs.append("marker").attr("id", `arr-${cluster}`)
+    // Arrowheads per community color
+    const communityIds = [...new Set(nodes.map(n => n.community_id || 0))];
+    communityIds.forEach(cid => {
+      const color = communityColor(cid);
+      defs.append("marker").attr("id", `arr-c${cid}`)
         .attr("viewBox", "0 0 10 10").attr("refX", 26).attr("refY", 5)
         .attr("markerWidth", 4).attr("markerHeight", 4).attr("orient", "auto-start-reverse")
-        .append("path").attr("d", "M1 1L9 5L1 9Z").attr("fill", color).attr("opacity", 0.6);
+        .append("path").attr("d", "M1 1L9 5L1 9Z").attr("fill", color).attr("opacity", 0.5);
     });
 
     const g = svg.append("g");
@@ -323,96 +363,75 @@ export default function KnowledgeGraph() {
     svg.call(zoom);
     zoomRef.current = zoom;
 
-    // Initial positions
-    if (isMulti) {
-      const angle = (2 * Math.PI) / centerNodes.length;
-      const orbit = Math.min(w, h) * 0.28;
-      centerNodes.forEach((cn, i) => {
-        cn.x = w / 2 + Math.cos(angle * i - Math.PI / 2) * orbit;
-        cn.y = h / 2 + Math.sin(angle * i - Math.PI / 2) * orbit;
-      });
-      nodes.filter(n => n.cluster !== "CENTER").forEach(n => {
-        const center = centerNodes.find(c => c.segIdx === n.segIdx) || centerNodes[0];
-        const a = Math.random() * Math.PI * 2;
-        const d = 60 + Math.random() * 120;
-        n.x = (center.x || w / 2) + Math.cos(a) * d;
-        n.y = (center.y || h / 2) + Math.sin(a) * d;
-      });
-    } else {
-      const cn = centerNodes[0];
-      if (cn) { cn.x = w / 2; cn.y = h / 2; }
-      // Cluster-sector placement so same-type nodes start grouped
-      const clGroups = {};
-      nodes.filter(n => n.cluster !== "CENTER").forEach(n => {
-        (clGroups[n.cluster] = clGroups[n.cluster] || []).push(n);
-      });
-      const clKeys = Object.keys(clGroups);
-      clKeys.forEach((cl, ci) => {
-        const base = (ci / clKeys.length) * 2 * Math.PI - Math.PI / 2;
-        clGroups[cl].forEach((n, ni) => {
-          const spread = (ni - (clGroups[cl].length - 1) / 2) * 0.4;
-          const a = base + spread;
-          const d = 100 + (ni % 4) * 45;
-          n.x = w / 2 + Math.cos(a) * d;
-          n.y = h / 2 + Math.sin(a) * d;
-        });
-      });
-    }
+    // Place nodes randomly — let physics find natural structure
+    // (no pre-placement bias that creates artificial star topology)
+    nodes.forEach(n => {
+      n.x = w / 2 + (Math.random() - 0.5) * w * 0.6;
+      n.y = h / 2 + (Math.random() - 0.5) * h * 0.6;
+    });
 
-    // Simulation — link distance based on edge weight
+    // Compute node radii from degree
+    nodes.forEach(n => {
+      n._r = nodeRadius(n.degree, n.is_center);
+    });
+
+    // ── Simulation ── no forceCenter (it fights natural clustering) ──────────
     if (simRef.current) simRef.current.stop();
+
     const sim = d3.forceSimulation(nodes)
       .force("link", d3.forceLink(links).id(d => d.id)
         .distance(l => {
           const w = l.weight || 1;
-          // Higher weight = stronger relationship = shorter distance
-          if (w >= 3) return 60;   // LLM-extracted
-          if (w >= 2) return 80;   // SVO
-          if (w >= 1) return 110;  // co-occurrence
-          return 180;              // bridge edges
+          if (w >= 3) return 55;    // LLM semantic: pull tight
+          if (w >= 2) return 75;    // SVO
+          if (w >= 1) return 100;   // co-occurrence
+          return 200;               // bridge: let float
         })
         .strength(l => {
           const w = l.weight || 1;
           if (w >= 3) return 0.8;
           if (w >= 2) return 0.6;
-          if (w >= 1) return 0.4;
-          return 0.15;  // bridge: very weak pull
+          if (w >= 1) return 0.35;
+          return 0.05;              // bridge: nearly no pull
         })
       )
+      // forceManyBody with stronger negative charge — replaces forceCenter
       .force("charge", d3.forceManyBody()
-        .strength(d => d.cluster === "CENTER" ? -800 : -200)
-        .distanceMax(500)
+        .strength(d => -(120 + d._r * 15))  // hub nodes repel more (ForceAtlas2-inspired)
+        .distanceMax(600)
       )
-      .force("collide", d3.forceCollide().radius(d => d.r + 18).strength(0.9))
-      .force("center", isMulti ? null : d3.forceCenter(w / 2, h / 2).strength(0.03))
-      .alphaDecay(0.015)
-      .velocityDecay(0.38);
+      .force("collide", d3.forceCollide().radius(d => d._r + 14).strength(0.85))
+      // No forceCenter — communities form organically
+      .alphaDecay(0.012)
+      .velocityDecay(0.4);
 
     simRef.current = sim;
 
-    // ── Draw links ─────────────────────────────────────────────────────────
+    // ── Links ─────────────────────────────────────────────────────────────
     const linkG = g.append("g");
     const linkEl = linkG.selectAll("line").data(links).join("line")
       .attr("stroke", l => edgeColor(l.label))
       .attr("stroke-width", l => edgeWidth(l.weight))
       .attr("stroke-opacity", l => {
         const w = l.weight || 1;
-        return w >= 3 ? 0.75 : w >= 2 ? 0.55 : w >= 1 ? 0.35 : 0.15;
+        return w >= 3 ? 0.75 : w >= 2 ? 0.55 : w >= 1 ? 0.35 : 0.12;
       })
       .attr("marker-end", l => {
         const t = typeof l.target === "object" ? l.target : nodes.find(n => n.id === l.target);
-        return `url(#arr-${t?.cluster || "MISC"})`;
+        const cid = t?.community_id || 0;
+        return `url(#arr-c${cid})`;
       });
+    linkElRef.current = linkEl;
 
     // Edge labels for strong edges only
     const strongLinks = links.filter(l => (l.weight || 1) >= 2);
     const linkLabelEl = linkG.selectAll("text").data(strongLinks).join("text")
       .attr("text-anchor", "middle").attr("font-size", 8)
       .attr("fill", "var(--text-muted)").attr("pointer-events", "none")
-      .attr("opacity", 0.6)
+      .attr("opacity", 0.55)
       .text(l => (l.label || "").slice(0, 14));
 
-    // ── Draw nodes ─────────────────────────────────────────────────────────
+    // ── Nodes ─────────────────────────────────────────────────────────────
     const nodeG = g.append("g");
     const nodeEl = nodeG.selectAll("g").data(nodes).join("g")
       .attr("cursor", "pointer")
@@ -421,7 +440,7 @@ export default function KnowledgeGraph() {
         .on("drag",  (ev, d) => { d.fx = ev.x; d.fy = ev.y; })
         .on("end",   (ev, d) => {
           if (!ev.active) sim.alphaTarget(0);
-          if (d.cluster !== "CENTER") { d.fx = null; d.fy = null; }
+          if (!d.is_center) { d.fx = null; d.fy = null; }
         })
       )
       .on("mouseover", (ev, d) => {
@@ -433,7 +452,7 @@ export default function KnowledgeGraph() {
           if (s === d.id) connIds.add(t);
           if (t === d.id) connIds.add(s);
         });
-        nodeEl.attr("opacity", n => connIds.has(n.id) ? 1 : 0.1);
+        nodeEl.attr("opacity", n => connIds.has(n.id) ? 1 : 0.08);
         linkEl
           .attr("stroke-opacity", l => {
             const s = typeof l.source === "object" ? l.source.id : l.source;
@@ -443,7 +462,7 @@ export default function KnowledgeGraph() {
           .attr("stroke-width", l => {
             const s = typeof l.source === "object" ? l.source.id : l.source;
             const t = typeof l.target === "object" ? l.target.id : l.target;
-            return (s === d.id || t === d.id) ? edgeWidth(l.weight) * 2 : 0.4;
+            return (s === d.id || t === d.id) ? edgeWidth(l.weight) * 2.5 : 0.3;
           });
       })
       .on("mousemove", ev => setTooltip(p => p ? { ...p, x: ev.clientX, y: ev.clientY } : p))
@@ -451,69 +470,56 @@ export default function KnowledgeGraph() {
         setTooltip(null);
         nodeEl.attr("opacity", 1);
         linkEl
-          .attr("stroke-opacity", l => {
-            const w = l.weight || 1;
-            return w >= 3 ? 0.75 : w >= 2 ? 0.55 : w >= 1 ? 0.35 : 0.15;
-          })
+          .attr("stroke-opacity", l => { const w = l.weight||1; return w>=3?0.75:w>=2?0.55:w>=1?0.35:0.12; })
           .attr("stroke-width", l => edgeWidth(l.weight));
       });
+    nodeElRef.current = nodeEl;
 
-    if (matches.size > 0)
-      nodeEl.attr("opacity", d => matches.has(d.id) || d.cluster === "CENTER" ? 1 : 0.08);
-
-    // Pulse ring for center nodes
-    nodeEl.filter(d => d.cluster === "CENTER").append("circle")
-      .attr("r", d => d.r + 12)
+    // Pulse ring for hub nodes (degree ≥ 5)
+    nodeEl.filter(d => d.degree >= 5 || d.is_center).append("circle")
+      .attr("r", d => d._r + 9)
       .attr("fill", "none")
-      .attr("stroke", d => cfg(d.cluster).color + "25")
+      .attr("stroke", d => communityColor(d.community_id || 0) + "25")
       .attr("stroke-width", 1)
       .attr("stroke-dasharray", "5 3");
 
-    // Search ring
-    if (matches.size > 0) {
-      nodeEl.filter(d => matches.has(d.id)).append("circle")
-        .attr("r", d => d.r + 8)
-        .attr("fill", "none").attr("stroke", "#fff")
-        .attr("stroke-width", 1.5).attr("stroke-dasharray", "3 3");
-    }
-
-    // Main circle
+    // Main circle — colored by COMMUNITY
     nodeEl.append("circle")
-      .attr("r", d => d.r)
-      .attr("fill", d => cfg(d.cluster).bg)
-      .attr("stroke", d => cfg(d.cluster).color)
-      .attr("stroke-width", d => d.cluster === "CENTER" ? 2 : 1.3)
-      .attr("filter", d => d.cluster === "CENTER" ? "url(#glow)" : null);
+      .attr("r", d => d._r)
+      .attr("fill", d => communityColor(d.community_id || 0) + "22")
+      .attr("stroke", d => communityColor(d.community_id || 0))
+      .attr("stroke-width", d => d.is_center ? 2.2 : 1.3)
+      .attr("filter", d => d.degree >= 8 ? "url(#glow)" : null);
 
-    // Icon
+    // Icon (cluster-type shape)
     nodeEl.append("text")
       .text(d => cfg(d.cluster).icon)
       .attr("text-anchor", "middle").attr("dominant-baseline", "central")
-      .attr("font-size", d => d.cluster === "CENTER" ? 12 : 8)
+      .attr("font-size", d => d.is_center ? 12 : 8)
+      .attr("fill", d => communityColor(d.community_id || 0))
       .attr("pointer-events", "none");
 
     // Label
     nodeEl.append("text")
       .text(d => {
-        const max = d.cluster === "CENTER" ? 20 : 16;
+        const max = d.is_center ? 20 : 15;
         return d.id.length > max ? d.id.slice(0, max - 1) + "…" : d.id;
       })
       .attr("text-anchor", "middle").attr("dominant-baseline", "hanging")
-      .attr("y", d => d.r + 5)
-      .attr("font-size", d => d.cluster === "CENTER" ? 11 : 8)
-      .attr("font-weight", d => d.cluster === "CENTER" ? "600" : "400")
-      .attr("fill", d => cfg(d.cluster).color)
+      .attr("y", d => d._r + 4)
+      .attr("font-size", d => d.is_center ? 11 : 8)
+      .attr("font-weight", d => d.is_center || d.degree >= 5 ? "600" : "400")
+      .attr("fill", d => communityColor(d.community_id || 0))
       .attr("pointer-events", "none");
 
-    // Tick
     sim.on("tick", () => {
       linkEl
         .attr("x1", d => d.source.x).attr("y1", d => d.source.y)
         .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
       linkLabelEl
-        .attr("x", d => ((d.source.x || 0) + (d.target.x || 0)) / 2)
-        .attr("y", d => ((d.source.y || 0) + (d.target.y || 0)) / 2 - 4);
-      nodeEl.attr("transform", d => `translate(${d.x || 0},${d.y || 0})`);
+        .attr("x", d => ((d.source.x||0)+(d.target.x||0))/2)
+        .attr("y", d => ((d.source.y||0)+(d.target.y||0))/2 - 4);
+      nodeEl.attr("transform", d => `translate(${d.x||0},${d.y||0})`);
     });
 
     sim.on("end", () => {
@@ -526,32 +532,33 @@ export default function KnowledgeGraph() {
     });
 
     return () => simRef.current?.stop();
-  }, [graphData, dims, activeFilters, searchQ, edgeMode]);
+  // Only full re-render on graphData or dims change — not on filter/search
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graphData, dims]);
 
   const handleFit = () => {
     if (!svgRef.current || !zoomRef.current) return;
     const svg = d3.select(svgRef.current);
     const gEl = svg.select("g");
     if (gEl.empty()) return;
-    const { w, h } = dims;
     const b = gEl.node().getBBox();
     if (!b.width) return;
+    const { w, h } = dims;
     const scale = Math.min(0.88, Math.min(w / (b.width + 100), h / (b.height + 100)));
     const tx = (w - b.width * scale) / 2 - b.x * scale;
     const ty = (h - b.height * scale) / 2 - b.y * scale;
     svg.transition().duration(500).call(zoomRef.current.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
   };
 
-  const { nodes, links } = visible();
+  const { nodes: visNodes, links: visLinks } = getVisible();
   const allClusters = [...new Set(graphData.nodes.map(n => n.cluster))].filter(c => c !== "CENTER");
   const clusterCounts = Object.fromEntries(allClusters.map(c => [c, graphData.nodes.filter(n => n.cluster === c).length]));
-  const matches = matchIds();
-  const docCount = rawGraph.length;
+  const matches = getMatchIds();
 
-  // Edge breakdown stats
-  const llmEdges  = graphData.links.filter(l => (l.weight || 0) >= 3).length;
-  const svoEdges  = graphData.links.filter(l => (l.weight || 0) >= 2 && (l.weight || 0) < 3).length;
-  const coocEdges = graphData.links.filter(l => (l.weight || 0) >= 1 && (l.weight || 0) < 2).length;
+  const llmEdges  = graphData.links.filter(l => (l.weight||0) >= 3).length;
+  const svoEdges  = graphData.links.filter(l => (l.weight||0) >= 2 && (l.weight||0) < 3).length;
+  const coocEdges = graphData.links.filter(l => (l.weight||0) >= 1 && (l.weight||0) < 2).length;
+  const bridgeEdges = graphData.links.filter(l => (l.weight||0) < 1).length;
 
   const toggleFilter = (c) => {
     setActiveFilters(prev => {
@@ -568,21 +575,18 @@ export default function KnowledgeGraph() {
         <div>
           <div className="page-title">Knowledge Graph</div>
           <div className="page-subtitle">
-            {docCount > 1 ? `${docCount} docs · multi-hub` : "Multi-relational entity graph"}
-            {" — "}{graphData.links.length} edges
-            {llmEdges > 0 && ` (${llmEdges} semantic, ${svoEdges} SVO, ${coocEdges} co-occurrence)`}
+            {graphData.numCommunities > 1 ? `${graphData.numCommunities} communities · ` : ""}
+            {graphData.nodes.length} nodes · {graphData.links.length} edges
+            {llmEdges > 0 && ` (${llmEdges} semantic, ${svoEdges} SVO, ${coocEdges} co-occ)`}
           </div>
         </div>
 
         {/* Search */}
         <div style={{ position: "relative" }}>
           <i className="ti ti-search" style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "var(--text-muted)", pointerEvents: "none" }} />
-          <input
-            type="text" value={searchQ}
-            onChange={e => setSearchQ(e.target.value)}
+          <input type="text" value={searchQ} onChange={e => setSearchQ(e.target.value)}
             placeholder="Find node…"
-            style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text-primary)", fontFamily: "var(--font)", fontSize: 12, padding: "6px 26px 6px 28px", outline: "none", width: 140 }}
-          />
+            style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text-primary)", fontFamily: "var(--font)", fontSize: 12, padding: "6px 26px 6px 28px", outline: "none", width: 140 }} />
           {searchQ && (
             <button onClick={() => setSearchQ("")} style={{ position: "absolute", right: 7, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", fontSize: 12, display: "flex", padding: 0 }}>
               <i className="ti ti-x" />
@@ -598,25 +602,22 @@ export default function KnowledgeGraph() {
             { id: "strong",   label: "SVO+" },
             { id: "semantic", label: "Semantic" },
           ].map(m => (
-            <button key={m.id} onClick={() => setEdgeMode(m.id)}
-              className="btn"
-              style={{
-                padding: "5px 10px", fontSize: 11,
+            <button key={m.id} onClick={() => setEdgeMode(m.id)} className="btn"
+              style={{ padding: "5px 10px", fontSize: 11,
                 background: edgeMode === m.id ? "var(--accent-dim)" : "var(--bg-raised)",
                 borderColor: edgeMode === m.id ? "var(--accent-dim2)" : "var(--border)",
-                color: edgeMode === m.id ? "var(--accent-light)" : "var(--text-muted)",
-              }}>
+                color: edgeMode === m.id ? "var(--accent-light)" : "var(--text-muted)" }}>
               {m.label}
             </button>
           ))}
         </div>
 
         <div className="graph-stats">
-          <span className="graph-stat"><strong>{nodes.length}</strong> nodes</span>
-          <span className="graph-stat"><strong>{links.length}</strong> edges</span>
+          <span className="graph-stat"><strong>{visNodes.length}</strong> nodes</span>
+          <span className="graph-stat"><strong>{visLinks.length}</strong> edges</span>
         </div>
 
-        <button className="btn" onClick={handleFit} disabled={!nodes.length}>
+        <button className="btn" onClick={handleFit} disabled={!visNodes.length}>
           <i className="ti ti-focus-2" /> Fit
         </button>
         <button className="btn" onClick={fetchGraph} disabled={loading}>
@@ -630,8 +631,7 @@ export default function KnowledgeGraph() {
         {error && (
           <div className="empty-state" style={{ position: "absolute", inset: 0 }}>
             <i className="ti ti-alert-circle" style={{ color: "var(--red)" }} />
-            <h3>Failed to load graph</h3>
-            <p>{error}</p>
+            <h3>Failed to load graph</h3><p>{error}</p>
             <button className="btn" onClick={fetchGraph} style={{ marginTop: 8 }}>Retry</button>
           </div>
         )}
@@ -640,71 +640,51 @@ export default function KnowledgeGraph() {
           <div className="empty-state" style={{ position: "absolute", inset: 0 }}>
             <i className="ti ti-share-2" />
             <h3>No graph data yet</h3>
-            <p>Upload documents — entities connect via semantic relationships, co-occurrence, and LLM-extracted links, not a hub-and-spoke structure.</p>
+            <p>Upload documents — entities connect via semantic relationships and are colored by community membership, not cluster type.</p>
           </div>
         )}
 
         {graphData.nodes.length > 0 && (
           <>
-            <svg ref={svgRef} width={dims.w} height={dims.h}
-              style={{ display: "block", background: "transparent" }} />
+            <svg ref={svgRef} width={dims.w} height={dims.h} style={{ display: "block", background: "transparent" }} />
 
-            <Legend clusters={allClusters} activeFilters={activeFilters}
-              onToggle={toggleFilter} counts={clusterCounts} />
+            <ClusterLegend clusters={allClusters} activeFilters={activeFilters} onToggle={toggleFilter} counts={clusterCounts} />
 
-            {tooltip && (
-              <Tooltip node={tooltip.node} x={tooltip.x} y={tooltip.y}
-                links={graphData.links} />
+            {tooltip && <Tooltip node={tooltip.node} x={tooltip.x} y={tooltip.y} links={graphData.links} />}
+
+            {/* Community legend */}
+            {graphData.numCommunities > 1 && (
+              <div style={{ position: "absolute", top: 14, left: 14, background: "var(--bg-surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "8px 14px", zIndex: 10, maxWidth: 180 }}>
+                <div style={{ fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.6px", marginBottom: 6 }}>Communities</div>
+                {Array.from({ length: Math.min(graphData.numCommunities, 8) }, (_, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: "50%", background: communityColor(i), flexShrink: 0 }} />
+                    <span style={{ fontSize: 11, color: "var(--text-secondary)" }}>Community {i}</span>
+                  </div>
+                ))}
+                {graphData.numCommunities > 8 && <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 2 }}>+{graphData.numCommunities - 8} more</div>}
+              </div>
             )}
 
             {/* Edge type legend */}
-            <div style={{
-              position: "absolute", bottom: 12, left: 14,
-              background: "var(--bg-surface)", border: "1px solid var(--border)",
-              borderRadius: 10, padding: "8px 14px",
-              display: "flex", gap: 14, alignItems: "center", zIndex: 10,
-            }}>
+            <div style={{ position: "absolute", bottom: 12, left: 14, background: "var(--bg-surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "8px 14px", display: "flex", gap: 14, alignItems: "center", zIndex: 10 }}>
               {[
                 { label: "LLM semantic",  color: "#8b84ff", w: 2.2, count: llmEdges },
                 { label: "SVO verb",      color: "#1fc791", w: 1.5, count: svoEdges },
                 { label: "Co-occurrence", color: "#ffffff", w: 1.0, count: coocEdges },
-                { label: "Bridge",        color: "#6b6b80", w: 0.6, count: graphData.links.filter(l => (l.weight||1) < 1).length },
+                { label: "Bridge",        color: "#6b6b80", w: 0.5, count: bridgeEdges, dash: true },
               ].filter(e => e.count > 0).map((e, i) => (
                 <div key={i} style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <svg width="22" height="10">
-                    <line x1="0" y1="5" x2="22" y2="5"
-                      stroke={e.color} strokeWidth={e.w} strokeOpacity={0.7}
-                      strokeDasharray={e.w < 1 ? "3 3" : "none"} />
+                    <line x1="0" y1="5" x2="22" y2="5" stroke={e.color} strokeWidth={e.w} strokeOpacity={0.7} strokeDasharray={e.dash ? "3 3" : "none"} />
                   </svg>
                   <span style={{ fontSize: 10, color: "var(--text-muted)" }}>
                     {e.label} <span style={{ color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>({e.count})</span>
                   </span>
                 </div>
               ))}
-              <span style={{ fontSize: 10, color: "var(--text-muted)", marginLeft: 4 }}>
-                Drag · Scroll to zoom
-              </span>
+              <span style={{ fontSize: 10, color: "var(--text-muted)", marginLeft: 4 }}>Node size = degree · Color = community</span>
             </div>
-
-            {/* Multi-doc indicator */}
-            {docCount > 1 && (
-              <div style={{
-                position: "absolute", top: 14, left: 14,
-                background: "var(--bg-surface)", border: "1px solid var(--accent-dim2)",
-                borderRadius: 10, padding: "7px 12px", zIndex: 10,
-                display: "flex", flexDirection: "column", gap: 4, maxWidth: 180,
-              }}>
-                <div style={{ fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.6px", marginBottom: 2 }}>Documents</div>
-                {rawGraph.map((seg, i) => (
-                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <div style={{ width: 7, height: 7, borderRadius: "50%", background: cfg("CENTER").color, flexShrink: 0 }} />
-                    <span style={{ fontSize: 11, color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {(seg.center?.id || `Doc ${i + 1}`).slice(0, 22)}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
           </>
         )}
       </div>

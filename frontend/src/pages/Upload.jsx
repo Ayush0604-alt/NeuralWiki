@@ -11,8 +11,8 @@ function fileIcon(name) {
   return "ti-file-text";
 }
 function formatBytes(bytes) {
-  if (bytes < 1024)        return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024)         return `${bytes} B`;
+  if (bytes < 1024 * 1024)  return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
@@ -38,9 +38,11 @@ function ConfirmModal({ title, body, confirmLabel = "Confirm", danger = false, o
 // ── Document Row ──────────────────────────────────────────────────────────────
 function DocRow({ doc, onDelete, deleting }) {
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", borderBottom: "1px solid var(--border-subtle)", transition: "background 150ms ease" }}
+    <div
+      style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", borderBottom: "1px solid var(--border-subtle)", transition: "background 150ms ease" }}
       onMouseEnter={e => e.currentTarget.style.background = "var(--bg-hover)"}
-      onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+      onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+    >
       <i className={`ti ${fileIcon(doc.filename)}`} style={{ fontSize: 16, color: "var(--accent-light)", flexShrink: 0 }} />
       <span style={{ flex: 1, fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         {doc.filename}
@@ -48,9 +50,11 @@ function DocRow({ doc, onDelete, deleting }) {
       <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 999, background: "var(--accent-dim)", color: "var(--accent-light)", fontFamily: "var(--font-mono)", flexShrink: 0 }}>
         {doc.chunks} chunks
       </span>
-      <button className="btn btn-danger" style={{ padding: "4px 10px", fontSize: 11, gap: 4 }}
+      <button
+        className="btn btn-danger" style={{ padding: "4px 10px", fontSize: 11, gap: 4 }}
         onClick={() => onDelete(doc.filename)} disabled={deleting === doc.filename}
-        title={`Remove ${doc.filename} from knowledge base`}>
+        title={`Remove ${doc.filename} from knowledge base`}
+      >
         {deleting === doc.filename
           ? <i className="ti ti-loader-2" style={{ animation: "spin 1s linear infinite" }} />
           : <i className="ti ti-trash" />}
@@ -61,16 +65,16 @@ function DocRow({ doc, onDelete, deleting }) {
 }
 
 // ── Main Component ────────────────────────────────────────────────────────────
-export default function Upload({ onKnowledgeBaseCleared }) {
-  const [dragOver, setDragOver]       = useState(false);
-  const [uploading, setUploading]     = useState(false);
-  const [progress, setProgress]       = useState(0);
-  const [currentFile, setCurrentFile] = useState(null);
-  const [stats, setStats]             = useState(null);
-  const [log, setLog]                 = useState([]);
-  const [docs, setDocs]               = useState([]);
-  const [docsLoading, setDocsLoading] = useState(false);
-  const [deletingFile, setDeletingFile] = useState(null);
+export default function Upload({ onKnowledgeBaseCleared, onDocumentAdded, onDocumentRemoved }) {
+  const [dragOver, setDragOver]           = useState(false);
+  const [uploading, setUploading]         = useState(false);
+  const [progress, setProgress]           = useState(0);
+  const [currentFile, setCurrentFile]     = useState(null);
+  const [stats, setStats]                 = useState(null);
+  const [log, setLog]                     = useState([]);
+  const [docs, setDocs]                   = useState([]);
+  const [docsLoading, setDocsLoading]     = useState(false);
+  const [deletingFile, setDeletingFile]   = useState(null);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
   const [confirmDelete, setConfirmDelete]     = useState(null);
 
@@ -82,7 +86,7 @@ export default function Upload({ onKnowledgeBaseCleared }) {
       const res  = await fetch(`${API}/documents`);
       const data = await res.json();
       setDocs(data.documents || []);
-    } catch { /* backend starting up */ }
+    } catch { /* backend may be starting */ }
     finally { setDocsLoading(false); }
   }, []);
 
@@ -95,7 +99,10 @@ export default function Upload({ onKnowledgeBaseCleared }) {
   const uploadFile = useCallback(async (file) => {
     if (!file) return;
     const ext = `.${getExt(file.name)}`;
-    if (!ALLOWED.includes(ext)) { addLog("error", `Unsupported file type: ${ext}. Use PDF, TXT, or MD.`); return; }
+    if (!ALLOWED.includes(ext)) {
+      addLog("error", `Unsupported type: ${ext}. Use PDF, TXT, or MD.`);
+      return;
+    }
 
     setCurrentFile(file); setUploading(true); setProgress(10); setStats(null);
     addLog("info", `Starting upload: ${file.name} (${formatBytes(file.size)})`);
@@ -112,11 +119,18 @@ export default function Upload({ onKnowledgeBaseCleared }) {
       if (!data.success) throw new Error(data.message || "Upload failed");
 
       setProgress(100);
-      setStats({ chunks: data.chunks_stored, entities: data.entities_found, relationships: data.relationships_found });
+      setStats({
+        chunks:        data.chunks_stored,
+        entities:      data.entities_found,
+        relationships: data.relationships_found,
+      });
       addLog("success", `Parsed and embedded ${data.chunks_stored} chunks`);
       addLog("success", `Extracted ${data.entities_found} entities, ${data.relationships_found} relationships`);
+      addLog("info", `Wiki generating in background…`);
       addLog("success", `${file.name} is ready for querying`);
+
       await refreshDocs();
+      onDocumentAdded?.();          // ← notify Graph + Wiki to refresh
     } catch (err) {
       clearInterval(ticker);
       setProgress(0);
@@ -125,7 +139,7 @@ export default function Upload({ onKnowledgeBaseCleared }) {
       setUploading(false);
       setTimeout(() => setProgress(0), 2000);
     }
-  }, [refreshDocs]);
+  }, [refreshDocs, onDocumentAdded]);
 
   const onFileChange = (e) => { const file = e.target.files?.[0]; if (file) uploadFile(file); e.target.value = ""; };
   const onDrop = (e) => { e.preventDefault(); setDragOver(false); uploadFile(e.dataTransfer.files?.[0]); };
@@ -136,11 +150,16 @@ export default function Upload({ onKnowledgeBaseCleared }) {
     setConfirmDelete(null);
     setDeletingFile(filename);
     try {
-      const res = await fetch(`${API}/delete-document`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename }) });
+      const res  = await fetch(`${API}/delete-document`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename }),
+      });
       const data = await res.json();
       if (!data.success) throw new Error(data.message);
       addLog("success", `'${filename}' removed (${data.chunks_deleted} chunks deleted)`);
       await refreshDocs();
+      onDocumentRemoved?.();        // ← notify Graph + Wiki to refresh
     } catch (err) {
       addLog("error", `Failed to delete '${filename}': ${err.message}`);
     } finally {
@@ -156,18 +175,23 @@ export default function Upload({ onKnowledgeBaseCleared }) {
       const res  = await fetch(`${API}/clear-documents`, { method: "POST" });
       const data = await res.json();
       if (!data.success) throw new Error(data.message);
-      addLog("success", `Cleared: ${data.chunks_deleted} chunks, ${data.files_deleted} files deleted`);
-      addLog("info", "Conversation memory and knowledge graph also reset");
+      addLog("success", `Cleared: ${data.chunks_deleted} chunks, ${data.files_deleted} files`);
+      addLog("info", "Conversation memory and knowledge graph reset");
       setStats(null);
       setDocs([]);
-      // ── Notify ChatBox to clear its message history (Feature #28) ──────
-      onKnowledgeBaseCleared?.();
+      onKnowledgeBaseCleared?.();   // clears ChatBox history
+      onDocumentRemoved?.();        // refreshes Graph + Wiki
     } catch (err) {
       addLog("error", `Clear failed: ${err.message}`);
     }
   };
 
-  const logIconMap = { success: "ti-circle-check", error: "ti-alert-circle", info: "ti-info-circle", warning: "ti-alert-triangle" };
+  const logIconMap = {
+    success: "ti-circle-check",
+    error:   "ti-alert-circle",
+    info:    "ti-info-circle",
+    warning: "ti-alert-triangle",
+  };
   const totalChunks = docs.reduce((s, d) => s + d.chunks, 0);
 
   return (
@@ -175,7 +199,7 @@ export default function Upload({ onKnowledgeBaseCleared }) {
       {confirmClearAll && (
         <ConfirmModal
           title="Clear entire knowledge base?"
-          body="This will permanently delete all uploaded documents, their embeddings, the knowledge graph, conversation history, and all wiki pages. The AI will have no context until you upload new documents."
+          body="This will permanently delete all uploaded documents, their embeddings, the knowledge graph, all conversation sessions, and all wiki pages."
           confirmLabel="Yes, clear everything"
           danger
           onConfirm={handleClearAllConfirmed}
@@ -199,31 +223,48 @@ export default function Upload({ onKnowledgeBaseCleared }) {
           <div className="page-subtitle">PDF, Markdown, or plain text · Max 50 MB</div>
         </div>
         {docs.length > 0 && (
-          <button className="btn btn-danger" style={{ marginTop: 2 }} onClick={() => setConfirmClearAll(true)} title="Delete all documents and reset the knowledge base">
+          <button
+            className="btn btn-danger" style={{ marginTop: 2 }}
+            onClick={() => setConfirmClearAll(true)}
+            title="Delete all documents and reset the knowledge base"
+          >
             <i className="ti ti-database-off" /> Clear knowledge base
           </button>
         )}
       </div>
 
       {/* Drop zone */}
-      <div className={`upload-zone${dragOver ? " drag-over" : ""}`}
+      <div
+        className={`upload-zone${dragOver ? " drag-over" : ""}`}
         onClick={() => !uploading && fileRef.current?.click()}
         onDragOver={e => { e.preventDefault(); setDragOver(true); }}
         onDragLeave={() => setDragOver(false)}
         onDrop={onDrop}
         role="button" tabIndex={0} aria-label="Upload document"
-        onKeyDown={e => e.key === "Enter" && fileRef.current?.click()}>
+        onKeyDown={e => e.key === "Enter" && fileRef.current?.click()}
+      >
         <input ref={fileRef} type="file" accept=".pdf,.txt,.md" onChange={onFileChange} aria-hidden="true" />
-        <i className={`ti ${uploading ? "ti-loader-2" : "ti-cloud-upload"} zone-icon`}
-          style={uploading ? { animation: "spin 1s linear infinite", display: "block" } : {}} aria-hidden="true" />
-        <div className="zone-title">{uploading ? `Processing ${currentFile?.name}…` : "Drop a file here or click to browse"}</div>
-        <div className="zone-sub">{uploading ? "Parsing, chunking, embedding…" : "Supported: PDF · TXT · MD"}</div>
+        <i
+          className={`ti ${uploading ? "ti-loader-2" : "ti-cloud-upload"} zone-icon`}
+          style={uploading ? { animation: "spin 1s linear infinite", display: "block" } : {}}
+          aria-hidden="true"
+        />
+        <div className="zone-title">
+          {uploading ? `Processing ${currentFile?.name}…` : "Drop a file here or click to browse"}
+        </div>
+        <div className="zone-sub">
+          {uploading ? "Parsing, chunking, embedding…" : "Supported: PDF · TXT · MD"}
+        </div>
       </div>
 
+      {/* Progress bar */}
       {(uploading || progress > 0) && currentFile && (
         <div className="upload-progress">
           <div className="upload-progress-header">
-            <div className="progress-filename"><i className={`ti ${fileIcon(currentFile.name)}`} style={{ marginRight: 6 }} />{currentFile.name}</div>
+            <div className="progress-filename">
+              <i className={`ti ${fileIcon(currentFile.name)}`} style={{ marginRight: 6 }} />
+              {currentFile.name}
+            </div>
             <span style={{ fontSize: 12, color: "var(--text-muted)", fontFamily: "var(--font-mono)" }}>{progress}%</span>
           </div>
           <div className="progress-bar-track" role="progressbar" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}>
@@ -232,6 +273,7 @@ export default function Upload({ onKnowledgeBaseCleared }) {
         </div>
       )}
 
+      {/* Stats */}
       {stats && (
         <div className="upload-stats">
           <div className="stat-card"><div className="stat-label">Chunks stored</div><div className="stat-value accent">{stats.chunks}</div></div>
@@ -259,7 +301,7 @@ export default function Upload({ onKnowledgeBaseCleared }) {
         <div style={{ maxHeight: 240, overflowY: "auto" }}>
           {docs.length === 0 && !docsLoading && (
             <div style={{ padding: "20px 16px", textAlign: "center", color: "var(--text-muted)", fontSize: 13, fontStyle: "italic" }}>
-              No documents in the knowledge base yet. Upload one above.
+              No documents yet. Upload one above.
             </div>
           )}
           {docsLoading && docs.length === 0 && (
@@ -268,13 +310,17 @@ export default function Upload({ onKnowledgeBaseCleared }) {
             </div>
           )}
           {docs.map(doc => (
-            <DocRow key={doc.filename} doc={doc} onDelete={name => setConfirmDelete(name)} deleting={deletingFile} />
+            <DocRow
+              key={doc.filename} doc={doc}
+              onDelete={name => setConfirmDelete(name)}
+              deleting={deletingFile}
+            />
           ))}
         </div>
         {docs.length > 0 && (
           <div style={{ padding: "10px 16px", borderTop: "1px solid var(--border-subtle)", fontSize: 11, color: "var(--text-muted)", lineHeight: 1.6 }}>
             <i className="ti ti-bulb" style={{ marginRight: 5, color: "var(--amber)" }} />
-            <strong style={{ color: "var(--text-secondary)" }}>Tip:</strong> Fewer, focused documents reduce retrieval noise and lower hallucination risk.
+            <strong style={{ color: "var(--text-secondary)" }}>Tip:</strong> Fewer, focused documents reduce retrieval noise.
           </div>
         )}
       </div>
@@ -300,7 +346,10 @@ export default function Upload({ onKnowledgeBaseCleared }) {
         </div>
       )}
 
-      <style>{`@keyframes spin { to { transform: rotate(360deg); } } @keyframes fadeUp { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }`}</style>
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes fadeUp { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+      `}</style>
     </div>
   );
 }

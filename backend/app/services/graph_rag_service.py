@@ -3,21 +3,15 @@ GraphRAG Service (unified)
 --------------------------
 Single source of truth for all knowledge-graph operations.
 
-Public API consumed by upload.py
----------------------------------
-  ingest_document_graph(doc_id, center, clusters, relationships, doc_type)
-  get_full_graph_for_frontend() -> list[dict]
-  get_graph_stats()             -> dict
-  remove_document(doc_id)       -> int
-  clear_graph()
-  find_query_entities(query)    -> list[str]
-  get_neighbors(entity, max_hops, max_nodes) -> list[dict]
-  find_paths(source, target, max_hops)       -> list[list[str]]
-  load_graph()
-  build_graph_context(query, max_triples)    -> str
-  enrich_retrieval_context(query, vector_chunks) -> str
-  get_graph_stats()             -> dict
-  query_related_entities(query, top_k)       -> list[dict]
+Changes vs original:
+  • get_full_graph_for_frontend() now returns BOTH the legacy document-segmented
+    format (for backward compatibility) AND a new flat node-link format under
+    the "flat" key. KnowledgeGraph.jsx should prefer the flat format.
+  • Community detection via NetworkX greedy_modularity_communities runs after
+    ingestion and is cached. Each node gains a community_id attribute.
+  • get_graph_stats() now includes betweenness centrality top-5 and community count.
+  • The "center" concept is preserved for the legacy format but the flat format
+    exposes degree + betweenness so the frontend can size nodes properly.
 """
 
 from __future__ import annotations
@@ -32,14 +26,10 @@ import networkx as nx
 
 logger = logging.getLogger(__name__)
 
-# ── Persistent MultiDiGraph ────────────────────────────────────────────────────
 _G: nx.MultiDiGraph = nx.MultiDiGraph()
-
-# entity_id → {cluster, freq, doc_ids, label}
 _entity_meta: dict[str, dict] = {}
-
-# filename → {entity_ids}
 _doc_entities: dict[str, set[str]] = {}
+_community_map: dict[str, int] = {}   # node_id → community_id
 
 _PERSIST_PATH = os.getenv("GRAPH_PERSIST_PATH", "chroma_db/knowledge_graph.json")
 
@@ -50,20 +40,19 @@ def _save() -> None:
     try:
         os.makedirs(os.path.dirname(_PERSIST_PATH), exist_ok=True)
         payload = {
-            "graph": nx.node_link_data(_G),
-            "meta": _entity_meta,
+            "graph":       nx.node_link_data(_G),
+            "meta":        _entity_meta,
             "doc_entities": {k: list(v) for k, v in _doc_entities.items()},
+            "communities": _community_map,
         }
         with open(_PERSIST_PATH, "w", encoding="utf-8") as f:
             json.dump(payload, f)
-        logger.debug("Graph persisted: %d nodes, %d edges", _G.number_of_nodes(), _G.number_of_edges())
     except Exception as exc:
         logger.warning("Graph persist failed: %s", exc)
 
 
 def load_graph() -> None:
-    """Restore persisted graph from disk. Call once at startup."""
-    global _G, _entity_meta, _doc_entities
+    global _G, _entity_meta, _doc_entities, _community_map
     if not os.path.exists(_PERSIST_PATH):
         return
     try:
@@ -72,6 +61,7 @@ def load_graph() -> None:
         _G = nx.node_link_graph(payload["graph"], directed=True, multigraph=True)
         _entity_meta = payload.get("meta", {})
         _doc_entities = {k: set(v) for k, v in payload.get("doc_entities", {}).items()}
+        _community_map = payload.get("communities", {})
         logger.info(
             "Graph loaded: %d nodes, %d edges, %d docs",
             _G.number_of_nodes(), _G.number_of_edges(), len(_doc_entities),
@@ -81,6 +71,28 @@ def load_graph() -> None:
         _G = nx.MultiDiGraph()
         _entity_meta = {}
         _doc_entities = {}
+        _community_map = {}
+
+
+# ── Community detection ────────────────────────────────────────────────────────
+
+def _recompute_communities() -> None:
+    """Run greedy modularity community detection on the undirected projection."""
+    global _community_map
+    if _G.number_of_nodes() < 3:
+        _community_map = {n: 0 for n in _G.nodes()}
+        return
+    try:
+        undirected = _G.to_undirected()
+        communities = list(nx.community.greedy_modularity_communities(undirected))
+        _community_map = {}
+        for cid, members in enumerate(communities):
+            for node in members:
+                _community_map[node] = cid
+        logger.info("Community detection: %d communities for %d nodes", len(communities), _G.number_of_nodes())
+    except Exception as exc:
+        logger.warning("Community detection failed: %s", exc)
+        _community_map = {n: 0 for n in _G.nodes()}
 
 
 # ── Write operations ───────────────────────────────────────────────────────────
@@ -92,20 +104,8 @@ def ingest_document_graph(
     relationships: list[dict],
     doc_type: str = "general",
 ) -> None:
-    """
-    Ingest one document's extracted graph data into the global graph.
-
-    Parameters
-    ----------
-    doc_id        : source filename (provenance tag)
-    center        : {"id": str, "label": str, "cluster": str}
-    clusters      : {"TECH": [{"id": str, "cluster": str}, ...], ...}
-    relationships : [{"source": str, "target": str, "label": str}, ...]
-    doc_type      : document classification string
-    """
     _doc_entities.setdefault(doc_id, set())
 
-    # Center node
     cid = center.get("id", "")
     if cid:
         _upsert_node(cid, cluster=center.get("cluster", "CENTER"),
@@ -113,7 +113,6 @@ def ingest_document_graph(
                      doc_type=doc_type, is_center=True)
         _doc_entities[doc_id].add(cid)
 
-    # Cluster nodes
     for cluster_name, nodes in clusters.items():
         for node in (nodes or []):
             nid = node.get("id", "")
@@ -123,7 +122,6 @@ def ingest_document_graph(
                          doc_id=doc_id, doc_type=doc_type)
             _doc_entities[doc_id].add(nid)
 
-    # Edges (deduplicated per doc)
     added_keys: set[tuple[str, str, str]] = set()
     for rel in relationships:
         src = rel.get("source", "").strip()
@@ -139,7 +137,6 @@ def ingest_document_graph(
         if key in added_keys:
             continue
 
-        # Skip if exact same edge+doc already stored
         already = False
         if _G.has_edge(src, tgt):
             for _, edata in _G[src][tgt].items():
@@ -148,7 +145,11 @@ def ingest_document_graph(
                     break
         if not already:
             added_keys.add(key)
-            _G.add_edge(src, tgt, label=lbl, doc_ids=[doc_id], weight=1.0)
+            weight = rel.get("weight", 1.0)
+            _G.add_edge(src, tgt, label=lbl, doc_ids=[doc_id], weight=weight)
+
+    # Recompute communities after each ingestion
+    _recompute_communities()
 
     _save()
     logger.info(
@@ -162,7 +163,6 @@ def ingest_document_graph(
 
 
 def _upsert_node(node_id: str, doc_id: str, **attrs: Any) -> None:
-    """Add or merge a node; accumulates doc_ids and increments freq."""
     if _G.has_node(node_id):
         existing = _G.nodes[node_id]
         doc_ids = list(set(existing.get("doc_ids", []) + [doc_id]))
@@ -185,11 +185,6 @@ def _upsert_node(node_id: str, doc_id: str, **attrs: Any) -> None:
 # ── Query operations ───────────────────────────────────────────────────────────
 
 def find_query_entities(query: str) -> list[str]:
-    """
-    Find graph nodes mentioned in the query.
-    Exact substring match first, then word-level partial match.
-    Returns up to 10 nodes sorted by degree (most connected first).
-    """
     if _G.number_of_nodes() == 0:
         return []
 
@@ -213,10 +208,6 @@ def find_query_entities(query: str) -> list[str]:
 
 
 def get_neighbors(entity: str, max_hops: int = 2, max_nodes: int = 60) -> list[dict]:
-    """
-    BFS expansion from *entity* (outgoing + incoming edges).
-    Returns list of {node, cluster, distance, path, via}.
-    """
     if not _G.has_node(entity):
         return []
 
@@ -229,32 +220,30 @@ def get_neighbors(entity: str, max_hops: int = 2, max_nodes: int = 60) -> list[d
         if dist >= max_hops:
             continue
 
-        # Outgoing
         for nbr in _G.successors(current):
             if nbr not in visited:
                 visited[nbr] = dist + 1
                 edge_labels = [edata.get("label", "→") for _, edata in _G[current][nbr].items()]
                 results.append({
-                    "node": nbr,
-                    "cluster": _G.nodes[nbr].get("cluster", "MISC"),
-                    "distance": dist + 1,
-                    "path": path + [nbr],
-                    "via": edge_labels,
+                    "node":      nbr,
+                    "cluster":   _G.nodes[nbr].get("cluster", "MISC"),
+                    "distance":  dist + 1,
+                    "path":      path + [nbr],
+                    "via":       edge_labels,
                     "direction": "out",
                 })
                 queue.append((nbr, dist + 1, path + [nbr]))
 
-        # Incoming (reverse)
         for nbr in _G.predecessors(current):
             if nbr not in visited:
                 visited[nbr] = dist + 1
                 edge_labels = [edata.get("label", "←") for _, edata in _G[nbr][current].items()]
                 results.append({
-                    "node": nbr,
-                    "cluster": _G.nodes[nbr].get("cluster", "MISC"),
-                    "distance": dist + 1,
-                    "path": [nbr] + path,
-                    "via": edge_labels,
+                    "node":      nbr,
+                    "cluster":   _G.nodes[nbr].get("cluster", "MISC"),
+                    "distance":  dist + 1,
+                    "path":      [nbr] + path,
+                    "via":       edge_labels,
                     "direction": "in",
                 })
                 queue.append((nbr, dist + 1, path + [nbr]))
@@ -263,7 +252,6 @@ def get_neighbors(entity: str, max_hops: int = 2, max_nodes: int = 60) -> list[d
 
 
 def find_paths(source: str, target: str, max_hops: int = 4) -> list[list[str]]:
-    """Find shortest simple paths between two entities (undirected view)."""
     if not (_G.has_node(source) and _G.has_node(target)):
         return []
     try:
@@ -276,17 +264,11 @@ def find_paths(source: str, target: str, max_hops: int = 4) -> list[list[str]]:
 # ── Context builders ───────────────────────────────────────────────────────────
 
 def build_graph_context(query: str, max_triples: int = 40) -> str:
-    """
-    Build a formatted graph context string for LLM injection.
-    Includes entity triples, multi-hop paths, entity summaries.
-    Returns empty string if no relevant graph data found.
-    """
     if _G.number_of_nodes() == 0:
         return ""
 
     seed_entities = find_query_entities(query)
     if not seed_entities:
-        # Fall back to top entities by degree
         seed_entities = [nid for nid, _ in sorted(
             _G.degree(), key=lambda x: x[1], reverse=True
         )[:5]]
@@ -311,9 +293,9 @@ def build_graph_context(query: str, max_triples: int = 40) -> str:
                 nodes_seen.add(nid)
                 meta = _entity_meta.get(nid, {})
                 all_nodes.append({
-                    "id": nid,
-                    "cluster": nbr_info["cluster"],
-                    "freq": meta.get("freq", 1),
+                    "id":       nid,
+                    "cluster":  nbr_info["cluster"],
+                    "freq":     meta.get("freq", 1),
                     "distance": nbr_info["distance"],
                 })
 
@@ -328,7 +310,6 @@ def build_graph_context(query: str, max_triples: int = 40) -> str:
             if nbr_info["distance"] >= 2:
                 all_paths.append(" → ".join(nbr_info["path"]))
 
-    # Cross-entity paths
     if len(seed_entities) >= 2:
         for i, s1 in enumerate(seed_entities[:3]):
             for s2 in seed_entities[i + 1: 4]:
@@ -357,7 +338,6 @@ def build_graph_context(query: str, max_triples: int = 40) -> str:
 
 
 def enrich_retrieval_context(query: str, vector_chunks: list[dict]) -> str:
-    """Combine vector chunks with graph context into one enriched context string."""
     vector_parts = [
         f"[Chunk {i + 1} | Source: {c['source']}]\n{c['content']}"
         for i, c in enumerate(vector_chunks)
@@ -372,12 +352,12 @@ def enrich_retrieval_context(query: str, vector_chunks: list[dict]) -> str:
 # ── Analytics ──────────────────────────────────────────────────────────────────
 
 def get_graph_stats() -> dict:
-    """Summary statistics for the graph."""
     if _G.number_of_nodes() == 0:
         return {
             "nodes": 0, "edges": 0, "components": 0,
             "density": 0.0, "documents": 0,
             "avg_degree": 0.0, "top_entities": [],
+            "communities": 0,
         }
 
     undirected = _G.to_undirected()
@@ -392,41 +372,43 @@ def get_graph_stats() -> dict:
     except Exception:
         top_central = []
 
+    num_communities = len(set(_community_map.values())) if _community_map else 0
+
     return {
-        "nodes": _G.number_of_nodes(),
-        "edges": _G.number_of_edges(),
-        "components": components,
-        "density": round(nx.density(_G), 6),
-        "documents": len(_doc_entities),
-        "avg_degree": round(
+        "nodes":        _G.number_of_nodes(),
+        "edges":        _G.number_of_edges(),
+        "components":   components,
+        "density":      round(nx.density(_G), 6),
+        "documents":    len(_doc_entities),
+        "avg_degree":   round(
             sum(d for _, d in _G.degree()) / max(_G.number_of_nodes(), 1), 2
         ),
         "top_entities": [
             {"id": nid, "centrality": round(c, 4)}
             for nid, c in top_central
         ],
+        "communities":  num_communities,
     }
 
 
 def get_top_entities(n: int = 20) -> list[dict]:
-    """Return top-n entities by degree."""
     if _G.number_of_nodes() == 0:
         return []
     ranked = sorted(_G.nodes(data=True), key=lambda x: _G.degree(x[0]), reverse=True)
     return [
         {
-            "id": nid,
-            "cluster": data.get("cluster", "MISC"),
-            "degree": _G.degree(nid),
-            "freq": _entity_meta.get(nid, {}).get("freq", 1),
-            "doc_ids": data.get("doc_ids", []),
+            "id":        nid,
+            "cluster":   data.get("cluster", "MISC"),
+            "degree":    _G.degree(nid),
+            "freq":      _entity_meta.get(nid, {}).get("freq", 1),
+            "doc_ids":   data.get("doc_ids", []),
+            "community": _community_map.get(nid, 0),
         }
         for nid, data in ranked[:n]
     ]
 
 
 def query_related_entities(query: str, top_k: int = 10) -> list[dict]:
-    """Return entities most relevant to a query, ranked by centrality × freq."""
     seed = find_query_entities(query)
     all_nodes: list[dict] = []
     nodes_seen: set[str] = set()
@@ -438,9 +420,9 @@ def query_related_entities(query: str, top_k: int = 10) -> list[dict]:
                 nodes_seen.add(nid)
                 meta = _entity_meta.get(nid, {})
                 all_nodes.append({
-                    "id": nid,
-                    "cluster": nbr["cluster"],
-                    "freq": meta.get("freq", 1),
+                    "id":       nid,
+                    "cluster":  nbr["cluster"],
+                    "freq":     meta.get("freq", 1),
                     "distance": nbr["distance"],
                 })
 
@@ -463,13 +445,56 @@ def query_related_entities(query: str, top_k: int = 10) -> list[dict]:
 
 def get_full_graph_for_frontend() -> list[dict]:
     """
-    Export graph grouped by source document.
-    Format matches the KnowledgeGraph.jsx expectation:
-      [{center, clusters, relationships, entities}, ...]
+    Export graph in two formats:
+
+    1. Legacy document-segmented format (each entry = one source doc):
+       [{center, clusters, relationships, entities}, ...]
+       Kept for backward compatibility.
+
+    2. Flat node-link format appended as the last list entry under key "_flat":
+       {"_flat": True, "nodes": [...], "links": [...]}
+       Nodes carry: id, cluster, community_id, degree, freq, doc_ids
+       Links carry: source, target, label, weight
+
+    KnowledgeGraph.jsx should check for the _flat entry and prefer it.
+    Cross-document relationships are only visible in the flat format.
     """
     if _G.number_of_nodes() == 0:
         return []
 
+    # ── Compute degree for all nodes ──────────────────────────────────────────
+    degree_map = dict(_G.degree())
+
+    # ── Build flat node list ───────────────────────────────────────────────────
+    flat_nodes = []
+    for nid, data in _G.nodes(data=True):
+        meta = _entity_meta.get(nid, {})
+        flat_nodes.append({
+            "id":          nid,
+            "cluster":     data.get("cluster", "MISC"),
+            "community_id": _community_map.get(nid, 0),
+            "degree":      degree_map.get(nid, 0),
+            "freq":        meta.get("freq", 1),
+            "doc_ids":     data.get("doc_ids", []),
+            "is_center":   bool(data.get("is_center", False)),
+        })
+
+    # ── Build flat link list ───────────────────────────────────────────────────
+    flat_links = []
+    seen_pairs: set[tuple] = set()
+    for src, tgt, edata in _G.edges(data=True):
+        key = (src, tgt, edata.get("label", ""))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        flat_links.append({
+            "source": src,
+            "target": tgt,
+            "label":  edata.get("label", "related_to"),
+            "weight": edata.get("weight", 1.0),
+        })
+
+    # ── Legacy document-segmented format ──────────────────────────────────────
     doc_segments: dict[str, dict] = {}
 
     for nid, data in _G.nodes(data=True):
@@ -478,10 +503,7 @@ def get_full_graph_for_frontend() -> list[dict]:
         primary_doc = doc_ids_list[0] if doc_ids_list else "unknown"
 
         seg = doc_segments.setdefault(primary_doc, {
-            "center": None,
-            "clusters": {},
-            "relationships": [],
-            "entities": [],
+            "center": None, "clusters": {}, "relationships": [], "entities": [],
         })
 
         if cluster == "CENTER" or data.get("is_center"):
@@ -498,14 +520,13 @@ def get_full_graph_for_frontend() -> list[dict]:
         primary_doc = doc_ids_list[0] if doc_ids_list else "unknown"
         if primary_doc in doc_segments:
             doc_segments[primary_doc]["relationships"].append({
-                "source": src,
-                "target": tgt,
-                "label": edata.get("label", "related_to"),
+                "source": src, "target": tgt,
+                "label":  edata.get("label", "related_to"),
+                "weight": edata.get("weight", 1.0),
             })
 
     results = []
     for doc_id, seg in doc_segments.items():
-        # Ensure every segment has a center
         if seg["center"] is None:
             doc_nodes = [
                 nid for nid, data in _G.nodes(data=True)
@@ -517,17 +538,20 @@ def get_full_graph_for_frontend() -> list[dict]:
         if seg["center"]:
             results.append(seg)
 
+    # Append the flat format as a sentinel entry
+    results.append({
+        "_flat":  True,
+        "nodes":  flat_nodes,
+        "links":  flat_links,
+        "num_communities": len(set(_community_map.values())) if _community_map else 0,
+    })
+
     return results
 
 
 # ── Document removal ───────────────────────────────────────────────────────────
 
 def remove_document(doc_id: str) -> int:
-    """
-    Remove nodes/edges that belong exclusively to doc_id.
-    Shared nodes have their doc_id entry removed but are kept.
-    Returns number of nodes fully deleted.
-    """
     nodes_removed = 0
     edges_to_remove: list[tuple] = []
 
@@ -556,12 +580,12 @@ def remove_document(doc_id: str) -> int:
     for src, tgt, key in edges_to_remove:
         _G.remove_edge(src, tgt, key=key)
 
-    # Remove nodes that have no doc left
     for nid in [n for n, d in list(_G.nodes(data=True)) if not d.get("doc_ids")]:
         _G.remove_node(nid)
         _entity_meta.pop(nid, None)
 
     _doc_entities.pop(doc_id, None)
+    _recompute_communities()
     _save()
 
     logger.info(
@@ -572,11 +596,11 @@ def remove_document(doc_id: str) -> int:
 
 
 def clear_graph() -> None:
-    """Wipe the entire graph and reset persistence."""
-    global _G, _entity_meta, _doc_entities
+    global _G, _entity_meta, _doc_entities, _community_map
     _G.clear()
     _entity_meta.clear()
     _doc_entities.clear()
+    _community_map.clear()
     if os.path.exists(_PERSIST_PATH):
         try:
             os.remove(_PERSIST_PATH)

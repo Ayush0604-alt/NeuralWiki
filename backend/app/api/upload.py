@@ -1,6 +1,12 @@
 """
 Upload API Router — GraphRAG edition (true graph structure)
 -----------------------------------------------------------
+Changes vs original:
+  • Wiki generation moved to FastAPI BackgroundTasks — upload returns immediately.
+  • Simple token-bucket rate limiter on /chat/stream (10 req / 60 s per IP).
+  • _sanitize_filename() now rejects filenames with no alphanumeric chars before ext.
+  • clear-documents calls clear_memory(session_id=None) to wipe ALL sessions.
+
 Pipeline order (critical):
   1. Parse text
   2. Chunk
@@ -9,13 +15,14 @@ Pipeline order (critical):
   5. generate_embeddings()
   6. store_embeddings()                (entity tags stored in ChromaDB)
   7. ingest_document_graph()
-  8. generate_wiki_page()
+  8. generate_wiki_page()              ← now runs in background
 """
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Request, UploadFile, File, HTTPException, status
 from fastapi.responses import StreamingResponse
 
-import os, re, json, logging, glob
+import os, re, json, logging, glob, time
+from collections import defaultdict
 
 from app.services.parser_service import parse_document
 from app.services.chunking_service import semantic_chunking
@@ -63,13 +70,38 @@ _SAFE_RE = re.compile(r"[^\w.\-]")
 load_graph()
 
 
+# ── Rate limiter (token bucket, in-memory per IP) ──────────────────────────────
+_rate_buckets: dict[str, dict] = defaultdict(lambda: {"tokens": 10, "last": time.monotonic()})
+_RATE_LIMIT = 10        # requests
+_RATE_WINDOW = 60.0     # seconds
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """Return True if request is allowed, False if rate-limited."""
+    now = time.monotonic()
+    bucket = _rate_buckets[ip]
+    elapsed = now - bucket["last"]
+    # Refill tokens proportionally
+    bucket["tokens"] = min(_RATE_LIMIT, bucket["tokens"] + elapsed * (_RATE_LIMIT / _RATE_WINDOW))
+    bucket["last"] = now
+    if bucket["tokens"] >= 1:
+        bucket["tokens"] -= 1
+        return True
+    return False
+
+
+# ── Filename sanitization ──────────────────────────────────────────────────────
+
 def _sanitize_filename(raw: str) -> str:
     name = os.path.basename(raw or "upload")
     name = _SAFE_RE.sub("_", name)
     name = re.sub(r"_+", "_", name).strip("_")
     parts = name.rsplit(".", 1)
-    if len(parts) == 2 and not parts[0]:
-        name = "upload." + parts[1]
+    # Reject filenames like "....pdf" — stem must have at least one alphanumeric char
+    stem = parts[0] if len(parts) == 2 else name
+    if not re.search(r"[a-zA-Z0-9]", stem):
+        stem = "upload"
+    name = (stem + "." + parts[1]) if len(parts) == 2 else stem
     return name or "upload"
 
 
@@ -84,6 +116,8 @@ def _delete_upload_file(filename: str) -> bool:
         return True
     return False
 
+
+# ── Wiki helper ────────────────────────────────────────────────────────────────
 
 def _make_wiki_llm():
     from openai import OpenAI
@@ -108,6 +142,15 @@ Be concise, accurate, and only use information from the document."""
         )
         return r.choices[0].message.content
     return _llm
+
+
+def _background_wiki(filename: str, text: str) -> None:
+    """Runs in a background task — does not block the upload response."""
+    try:
+        generate_wiki_page(filename, text, _make_wiki_llm())
+        logger.info("Background wiki generated for '%s'", filename)
+    except Exception as exc:
+        logger.warning("Background wiki failed for '%s': %s", filename, exc)
 
 
 _GRAPHRAG_ADDENDUM = """
@@ -142,7 +185,7 @@ def _build_graphrag_context(query: str, retrieval: dict, history: str) -> str:
 # ── Upload ────────────────────────────────────────────────────────────────────
 
 @router.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     raw_name = file.filename or "upload.bin"
     filename = _sanitize_filename(raw_name)
     ext = os.path.splitext(filename)[1].lower()
@@ -183,7 +226,7 @@ async def upload_file(file: UploadFile = File(...)):
         # 3. Link entities to chunks BEFORE embedding
         chunks = link_entities_to_chunks(chunks, graph_data["entities"], dedup_map)
 
-        # 4. Embed
+        # 4. Embed (entities key is now propagated correctly)
         embedded_chunks = generate_embeddings(chunks)
 
         # 5. Store vectors (entity tags go into ChromaDB metadata)
@@ -201,19 +244,14 @@ async def upload_file(file: UploadFile = File(...)):
             doc_type=graph_data.get("doc_type", "general"),
         )
 
-        # 8. Wiki
-        wiki_generated = False
-        try:
-            generate_wiki_page(filename, extracted_text, _make_wiki_llm())
-            wiki_generated = True
-        except Exception as e:
-            logger.warning("Wiki skipped for '%s': %s", filename, e)
+        # 8. Wiki — runs in background so upload returns immediately
+        background_tasks.add_task(_background_wiki, filename, extracted_text)
 
         total_links = sum(len(c.get("entities", [])) for c in embedded_chunks)
         logger.info(
-            "Uploaded '%s': %d chunks, %d entities, %d rels, %d links, %d merges, wiki=%s",
+            "Uploaded '%s': %d chunks, %d entities, %d rels, %d links, %d merges",
             filename, len(embedded_chunks), len(graph_data["entities"]),
-            len(graph_data["relationships"]), total_links, len(dedup_map), wiki_generated,
+            len(graph_data["relationships"]), total_links, len(dedup_map),
         )
 
         return {
@@ -225,8 +263,8 @@ async def upload_file(file: UploadFile = File(...)):
             "relationships_found": len(graph_data["relationships"]),
             "entity_chunk_links":  total_links,
             "entity_dedup_merges": len(dedup_map),
-            "wiki_generated":      wiki_generated,
-            "message":             "Document processed successfully",
+            "wiki_generated":      False,   # wiki generates in background
+            "message":             "Document processed successfully. Wiki generating in background.",
         }
 
     except Exception:
@@ -256,8 +294,8 @@ async def delete_one_document(body: dict):
     filename = _sanitize_filename((body.get("filename") or "").strip())
     if not filename:
         raise HTTPException(status_code=400, detail="filename required")
-    chunks_deleted     = delete_document(filename)
-    file_deleted       = _delete_upload_file(filename)
+    chunks_deleted      = delete_document(filename)
+    file_deleted        = _delete_upload_file(filename)
     graph_nodes_removed = graph_remove_document(filename)
     delete_wiki_page(filename)
     return {
@@ -281,7 +319,7 @@ async def clear_all():
                 logger.warning("Could not delete %s: %s", path, e)
     clear_knowledge_graph()
     graph_clear()
-    clear_memory()
+    clear_memory(session_id=None)   # wipe ALL sessions
     wiki_cleared = clear_wiki_pages()
     return {
         "success": True,
@@ -344,10 +382,18 @@ async def chat(request: dict):
 # ── Chat (SSE streaming) ──────────────────────────────────────────────────────
 
 @router.post("/chat/stream")
-async def chat_stream(request: dict):
-    query = (request.get("query") or "").strip()
+async def chat_stream(request: Request, body: dict):
+    query = (body.get("query") or "").strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query required")
+
+    # Rate limit by IP
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Please wait before sending another message.",
+        )
 
     add_message("User", query)
     history   = get_conversation_history()
@@ -428,7 +474,7 @@ async def chat_stream(request: dict):
 
 @router.post("/clear-memory")
 async def reset_memory():
-    clear_memory()
+    clear_memory()   # clears default session
     return {"success": True, "message": "Memory cleared"}
 
 
@@ -492,7 +538,7 @@ async def get_single_wiki_page(filename: str):
 
 
 @router.post("/wiki/generate")
-async def regenerate_wiki(body: dict):
+async def regenerate_wiki(background_tasks: BackgroundTasks, body: dict):
     filename = _sanitize_filename((body.get("filename") or "").strip())
     if not filename:
         raise HTTPException(status_code=400, detail="filename required")
@@ -505,6 +551,7 @@ async def regenerate_wiki(body: dict):
         text = parse_document(file_path)
         if not text or not text.strip():
             raise ValueError("Empty document")
+        # Run synchronously here since the caller expects the page back immediately
         page = generate_wiki_page(filename, text, _make_wiki_llm())
         return {"success": True, "page": page}
     except Exception as exc:

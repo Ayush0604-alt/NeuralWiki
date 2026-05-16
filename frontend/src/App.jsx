@@ -7,34 +7,50 @@ import Wiki from "./components/Wiki";
 import "./App.css";
 
 const NAV = [
-  { id: "chat",   icon: "ti-message-2",   label: "Chat" },
-  { id: "wiki",   icon: "ti-book",        label: "Wiki" },
-  { id: "search", icon: "ti-search",      label: "Search" },
-  { id: "graph",  icon: "ti-share-2",     label: "Graph" },
-  { id: "upload", icon: "ti-cloud-upload",label: "Upload" },
+  { id: "chat",   icon: "ti-message-2",    label: "Chat" },
+  { id: "wiki",   icon: "ti-book",         label: "Wiki" },
+  { id: "search", icon: "ti-search",       label: "Search" },
+  { id: "graph",  icon: "ti-share-2",      label: "Graph" },
+  { id: "upload", icon: "ti-cloud-upload", label: "Upload" },
 ];
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("chat");
   const [backendStatus, setBackendStatus] = useState("checking");
 
-  // ── Cross-component event bus for "knowledge base cleared" ──────────────────
-  // Upload calls notifyKbCleared(); ChatBox subscribes via onKnowledgeBaseCleared.
-  // Using a ref-based pub/sub so neither component needs to be remounted.
-  const kbClearedListeners = useRef([]);
+  // ── Lightweight pub/sub event bus ──────────────────────────────────────────
+  // Supported events: "kbCleared" | "documentAdded" | "documentRemoved"
+  // Components subscribe via the factory props below.
+  const listeners = useRef({
+    kbCleared:       [],
+    documentAdded:   [],
+    documentRemoved: [],
+  });
 
-  const notifyKbCleared = useCallback(() => {
-    kbClearedListeners.current.forEach(fn => fn());
+  const emit = useCallback((event) => {
+    (listeners.current[event] || []).forEach(fn => fn());
   }, []);
 
-  // Stable subscribe factory passed as prop to ChatBox.
-  // Returns an unsubscribe function (for useEffect cleanup).
-  const onKnowledgeBaseCleared = useCallback((listener) => {
-    kbClearedListeners.current.push(listener);
+  const subscribe = useCallback((event, listener) => {
+    listeners.current[event] = [...(listeners.current[event] || []), listener];
     return () => {
-      kbClearedListeners.current = kbClearedListeners.current.filter(fn => fn !== listener);
+      listeners.current[event] = (listeners.current[event] || []).filter(fn => fn !== listener);
     };
   }, []);
+
+  // Stable factories passed as props — each wraps `subscribe`
+  const onKnowledgeBaseCleared = useCallback(
+    (fn) => subscribe("kbCleared", fn),
+    [subscribe],
+  );
+  const onDocumentAdded = useCallback(
+    (fn) => subscribe("documentAdded", fn),
+    [subscribe],
+  );
+  const onDocumentRemoved = useCallback(
+    (fn) => subscribe("documentRemoved", fn),
+    [subscribe],
+  );
 
   useState(() => {
     (async () => {
@@ -69,7 +85,9 @@ export default function App() {
         </nav>
         <div className="status-pill" data-status={backendStatus}>
           <span className="status-dot" />
-          {backendStatus === "online" ? "Backend online" : backendStatus === "offline" ? "Backend offline" : "Connecting…"}
+          {backendStatus === "online" ? "Backend online"
+            : backendStatus === "offline" ? "Backend offline"
+            : "Connecting…"}
         </div>
       </header>
 
@@ -77,11 +95,21 @@ export default function App() {
         <div className={`tab-panel${activeTab === "chat"   ? " active" : ""}`}>
           <ChatBox onKnowledgeBaseCleared={onKnowledgeBaseCleared} />
         </div>
-        <div className={`tab-panel${activeTab === "wiki"   ? " active" : ""}`}><Wiki /></div>
+        <div className={`tab-panel${activeTab === "wiki"   ? " active" : ""}`}>
+          {/* Wiki auto-refreshes when a document is added or removed */}
+          <Wiki onDocumentAdded={onDocumentAdded} onDocumentRemoved={onDocumentRemoved} />
+        </div>
         <div className={`tab-panel${activeTab === "search" ? " active" : ""}`}><SearchBox /></div>
-        <div className={`tab-panel${activeTab === "graph"  ? " active" : ""}`}><KnowledgeGraph /></div>
+        <div className={`tab-panel${activeTab === "graph"  ? " active" : ""}`}>
+          {/* Graph auto-refreshes when a document is added or removed */}
+          <KnowledgeGraph onDocumentAdded={onDocumentAdded} onDocumentRemoved={onDocumentRemoved} />
+        </div>
         <div className={`tab-panel${activeTab === "upload" ? " active" : ""}`}>
-          <Upload onKnowledgeBaseCleared={notifyKbCleared} />
+          <Upload
+            onKnowledgeBaseCleared={() => emit("kbCleared")}
+            onDocumentAdded={() => emit("documentAdded")}
+            onDocumentRemoved={() => emit("documentRemoved")}
+          />
         </div>
       </main>
     </div>
