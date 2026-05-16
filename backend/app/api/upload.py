@@ -1,21 +1,30 @@
 """
 Upload API Router — GraphRAG edition (true graph structure)
 -----------------------------------------------------------
-Changes vs original:
-  • Wiki generation moved to FastAPI BackgroundTasks — upload returns immediately.
-  • Simple token-bucket rate limiter on /chat/stream (10 req / 60 s per IP).
-  • _sanitize_filename() now rejects filenames with no alphanumeric chars before ext.
-  • clear-documents calls clear_memory(session_id=None) to wipe ALL sessions.
+Integrates three pipeline fixes:
+
+  Fix 1 — semantic_chunking() is now sentence-aware with overlap
+           (chunking_service.py handles this transparently).
+
+  Fix 2 — parse_document() now returns a rich dict (text + page metadata).
+           annotate_chunks_with_pages() maps each chunk to its source page.
+           store_embeddings() receives doc_meta so page/author/title are
+           persisted in ChromaDB and surfaced in search results.
+
+  Fix 3 — knowledge_graph_service now runs LLM entity extraction first,
+           before spaCy NER, giving much higher recall on domain terms
+           (handled transparently inside extract_entities_and_relationships).
 
 Pipeline order (critical):
-  1. Parse text
-  2. Chunk
-  3. Extract entities + relationships  (3-layer: SVO + co-occurrence + LLM)
-  4. link_entities_to_chunks()         (tag chunks BEFORE embedding)
-  5. generate_embeddings()
-  6. store_embeddings()                (entity tags stored in ChromaDB)
-  7. ingest_document_graph()
-  8. generate_wiki_page()              ← now runs in background
+  1. Parse text  →  now returns dict with text + page metadata
+  2. Chunk  →  sentence-aware with overlap
+  3. Annotate chunks with page numbers / section headings
+  4. Extract entities + relationships  (Layer 0 LLM + SVO + co-occ + LLM rels)
+  5. link_entities_to_chunks()         (tag chunks BEFORE embedding)
+  6. generate_embeddings()
+  7. store_embeddings()                (entity tags + page metadata in ChromaDB)
+  8. ingest_document_graph()
+  9. generate_wiki_page()              ← runs in background
 """
 
 from fastapi import APIRouter, BackgroundTasks, Request, UploadFile, File, HTTPException, status
@@ -81,7 +90,6 @@ def _check_rate_limit(ip: str) -> bool:
     now = time.monotonic()
     bucket = _rate_buckets[ip]
     elapsed = now - bucket["last"]
-    # Refill tokens proportionally
     bucket["tokens"] = min(_RATE_LIMIT, bucket["tokens"] + elapsed * (_RATE_LIMIT / _RATE_WINDOW))
     bucket["last"] = now
     if bucket["tokens"] >= 1:
@@ -97,7 +105,6 @@ def _sanitize_filename(raw: str) -> str:
     name = _SAFE_RE.sub("_", name)
     name = re.sub(r"_+", "_", name).strip("_")
     parts = name.rsplit(".", 1)
-    # Reject filenames like "....pdf" — stem must have at least one alphanumeric char
     stem = parts[0] if len(parts) == 2 else name
     if not re.search(r"[a-zA-Z0-9]", stem):
         stem = "upload"
@@ -152,6 +159,59 @@ def _background_wiki(filename: str, text: str) -> None:
     except Exception as exc:
         logger.warning("Background wiki failed for '%s': %s", filename, exc)
 
+
+# ── Fix 2: page annotation helper ─────────────────────────────────────────────
+
+def _annotate_chunks_with_pages(
+    chunks: list[dict],
+    pages: list[dict],
+) -> list[dict]:
+    """
+    Assign page_number and section_heading to each chunk.
+
+    Strategy: for each page whose heading shares the most words with the
+    chunk content, assign that page number to the chunk.  Falls back to
+    page 1 when no heading matches.
+
+    A more precise approach (char-offset intersection) would require
+    chunking_service to expose char_start/char_end per chunk; this
+    keyword-overlap approach is accurate enough for citation display.
+    """
+    if not pages:
+        return chunks
+
+    # Pre-build lookup: [(heading_words, page_number, heading_raw)]
+    page_lookup: list[tuple[list[str], int, str]] = []
+    for p in pages:
+        heading = (p.get("heading") or "").strip()
+        if heading and len(heading) > 3:
+            words = [w.lower() for w in heading.split() if len(w) > 3]
+            if words:
+                page_lookup.append((words, p["page_number"], heading))
+
+    default_page    = pages[0]["page_number"]
+    default_heading = pages[0].get("heading", "")
+
+    for chunk in chunks:
+        content_lower = chunk["content"].lower()
+        best_page    = default_page
+        best_heading = default_heading
+        best_score   = 0
+
+        for words, page_num, heading_raw in page_lookup:
+            score = sum(1 for w in words if w in content_lower)
+            if score > best_score:
+                best_score   = score
+                best_page    = page_num
+                best_heading = heading_raw
+
+        chunk["page_number"]     = best_page
+        chunk["section_heading"] = best_heading
+
+    return chunks
+
+
+# ── GraphRAG context builder ───────────────────────────────────────────────────
 
 _GRAPHRAG_ADDENDUM = """
 You also have access to a **Knowledge Graph context** with:
@@ -212,30 +272,43 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
         f.write(content)
 
     try:
-        extracted_text = parse_document(file_path)
-        if not extracted_text or not extracted_text.strip():
+        # ── Fix 2: parse_document now returns a dict ───────────────────────
+        parsed = parse_document(file_path)
+        if not parsed or not parsed.get("text", "").strip():
             raise ValueError("Document is empty or could not be parsed.")
 
-        # 1. Chunk
+        extracted_text = parsed["text"]
+        pages          = parsed.get("pages", [])
+        doc_meta       = {
+            "title":       parsed.get("title",       filename),
+            "author":      parsed.get("author",       ""),
+            "created_at":  parsed.get("created_at",   ""),
+            "total_pages": parsed.get("total_pages",  1),
+        }
+
+        # ── Fix 1: sentence-aware chunking with overlap ────────────────────
         chunks = semantic_chunking(extracted_text)
 
-        # 2. Extract entities + relationships (3-layer)
+        # ── Fix 2: annotate each chunk with its source page + heading ──────
+        chunks = _annotate_chunks_with_pages(chunks, pages)
+
+        # ── Fix 3: LLM-first entity extraction (transparent inside here) ──
         graph_data = extract_entities_and_relationships(extracted_text)
         dedup_map  = graph_data.pop("_dedup_map", {})
 
-        # 3. Link entities to chunks BEFORE embedding
+        # Link entities to chunks BEFORE embedding
         chunks = link_entities_to_chunks(chunks, graph_data["entities"], dedup_map)
 
-        # 4. Embed (entities key is now propagated correctly)
+        # Embed
         embedded_chunks = generate_embeddings(chunks)
 
-        # 5. Store vectors (entity tags go into ChromaDB metadata)
-        store_embeddings(filename, embedded_chunks)
+        # ── Fix 2: store with full doc_meta so page fields hit ChromaDB ───
+        store_embeddings(filename, embedded_chunks, doc_meta=doc_meta)
 
-        # 6. Legacy graph store
+        # Legacy graph store
         store_knowledge_graph(graph_data)
 
-        # 7. GraphRAG persistent graph
+        # GraphRAG persistent graph
         ingest_document_graph(
             doc_id=filename,
             center=graph_data.get("center", {}),
@@ -244,14 +317,15 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
             doc_type=graph_data.get("doc_type", "general"),
         )
 
-        # 8. Wiki — runs in background so upload returns immediately
+        # Wiki runs in background so upload returns immediately
         background_tasks.add_task(_background_wiki, filename, extracted_text)
 
         total_links = sum(len(c.get("entities", [])) for c in embedded_chunks)
         logger.info(
-            "Uploaded '%s': %d chunks, %d entities, %d rels, %d links, %d merges",
+            "Uploaded '%s': %d chunks, %d entities, %d rels, %d links, %d merges, %d pages",
             filename, len(embedded_chunks), len(graph_data["entities"]),
             len(graph_data["relationships"]), total_links, len(dedup_map),
+            doc_meta["total_pages"],
         )
 
         return {
@@ -263,7 +337,9 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
             "relationships_found": len(graph_data["relationships"]),
             "entity_chunk_links":  total_links,
             "entity_dedup_merges": len(dedup_map),
-            "wiki_generated":      False,   # wiki generates in background
+            "doc_title":           doc_meta["title"],
+            "total_pages":         doc_meta["total_pages"],
+            "wiki_generated":      False,
             "message":             "Document processed successfully. Wiki generating in background.",
         }
 
@@ -319,7 +395,7 @@ async def clear_all():
                 logger.warning("Could not delete %s: %s", path, e)
     clear_knowledge_graph()
     graph_clear()
-    clear_memory(session_id=None)   # wipe ALL sessions
+    clear_memory(session_id=None)
     wiki_cleared = clear_wiki_pages()
     return {
         "success": True,
@@ -387,7 +463,6 @@ async def chat_stream(request: Request, body: dict):
     if not query:
         raise HTTPException(status_code=400, detail="Query required")
 
-    # Rate limit by IP
     client_ip = request.client.host if request.client else "unknown"
     if not _check_rate_limit(client_ip):
         raise HTTPException(
@@ -474,7 +549,7 @@ async def chat_stream(request: Request, body: dict):
 
 @router.post("/clear-memory")
 async def reset_memory():
-    clear_memory()   # clears default session
+    clear_memory()
     return {"success": True, "message": "Memory cleared"}
 
 
@@ -548,11 +623,11 @@ async def regenerate_wiki(background_tasks: BackgroundTasks, body: dict):
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
     try:
-        text = parse_document(file_path)
-        if not text or not text.strip():
+        # Fix 2: parse_document returns dict
+        parsed = parse_document(file_path)
+        if not parsed or not parsed.get("text", "").strip():
             raise ValueError("Empty document")
-        # Run synchronously here since the caller expects the page back immediately
-        page = generate_wiki_page(filename, text, _make_wiki_llm())
+        page = generate_wiki_page(filename, parsed["text"], _make_wiki_llm())
         return {"success": True, "page": page}
     except Exception as exc:
         logger.exception("Wiki regen failed for '%s'", filename)
