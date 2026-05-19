@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import * as d3 from "d3";
 
 const API = "http://127.0.0.1:8000";
@@ -37,29 +37,29 @@ function nodeRadius(degree, isCenter) {
 }
 
 const EDGE_COLORS = {
-  "co-occurs with":  "#ffffff18",
-  "related to":      "#ffffff22",
-  "associated with": "#ffffff22",
-  "integrates with": "#47bfff55",
-  "uses":            "#47bfff44",
-  "is part of":      "#1fc79144",
-  "depends on":      "#f5a62344",
-  "outperforms":     "#e0525244",
-  "causes":          "#ff9f4344",
-  "is type of":      "#c47aff44",
-  "based on":        "#8b84ff44",
-  "derived from":    "#8b84ff33",
-  "enables":         "#1fc79133",
-  "contradicts":     "#e0525255",
+  "co-occurs with":  "#8f98b6",
+  "related to":      "#a2adc7",
+  "associated with": "#a2adc7",
+  "integrates with": "#47bfff",
+  "uses":            "#47bfff",
+  "is part of":      "#1fc791",
+  "depends on":      "#f5a623",
+  "outperforms":     "#e05252",
+  "causes":          "#ff9f43",
+  "is type of":      "#c47aff",
+  "based on":        "#8b84ff",
+  "derived from":    "#8b84ff",
+  "enables":         "#1fc791",
+  "contradicts":     "#ff5c5c",
 };
 
 function edgeColor(label) {
-  if (!label) return "#ffffff18";
+  if (!label) return "#8f98b6";
   const lo = label.toLowerCase();
   for (const [key, col] of Object.entries(EDGE_COLORS)) {
     if (lo.includes(key)) return col;
   }
-  return "#ffffff20";
+  return "#a2adc7";
 }
 
 function edgeWidth(weight) {
@@ -224,13 +224,16 @@ function ClusterLegend({ clusters, activeFilters, onToggle, counts }) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
   const [rawArray, setRawArray]     = useState([]);
-  const [graphData, setGraphData]   = useState({ nodes: [], links: [], numCommunities: 0 });
   const [loading, setLoading]       = useState(false);
   const [error, setError]           = useState("");
   const [tooltip, setTooltip]       = useState(null);
   const [searchQ, setSearchQ]       = useState("");
   const [activeFilters, setActiveFilters] = useState(new Set());
-  const [edgeMode, setEdgeMode]     = useState("all");
+  const [edgeMode, setEdgeMode]     = useState("strong");
+  const [showCrossCommunityOnly, setShowCrossCommunityOnly] = useState(false);
+  const [showEdgeLabels, setShowEdgeLabels] = useState(false);
+  const [selectedNodeId, setSelectedNodeId] = useState(null);
+  const [focusOnSelection, setFocusOnSelection] = useState(false);
 
   const svgRef  = useRef(null);
   const wrapRef = useRef(null);
@@ -264,7 +267,13 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
     finally { setLoading(false); }
   }, []);
 
-  useEffect(() => { fetchGraph(); }, [fetchGraph]);
+  useEffect(() => {
+    let cancelled = false;
+    Promise.resolve().then(() => {
+      if (!cancelled) fetchGraph();
+    });
+    return () => { cancelled = true; };
+  }, [fetchGraph]);
 
   // Auto-refresh when a document is uploaded or deleted
   useEffect(() => {
@@ -274,26 +283,72 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
     return () => unsubs.forEach(u => u?.());
   }, [onDocumentAdded, onDocumentRemoved, fetchGraph]);
 
-  useEffect(() => {
-    const parsed = parseGraphResponse(rawArray);
-    setGraphData(parsed);
-    const clusters = [...new Set(parsed.nodes.map(n => n.cluster))].filter(c => c !== "CENTER");
-    setActiveFilters(new Set(clusters));
-  }, [rawArray]);
+  const graphData = useMemo(() => parseGraphResponse(rawArray), [rawArray]);
+  const allClusters = useMemo(
+    () => [...new Set(graphData.nodes.map(n => n.cluster))].filter(c => c !== "CENTER"),
+    [graphData.nodes],
+  );
+  const effectiveActiveFilters = useMemo(() => {
+    if (!activeFilters.size) return new Set(allClusters);
+    const next = new Set([...activeFilters].filter(c => allClusters.includes(c)));
+    return next.size ? next : new Set(allClusters);
+  }, [activeFilters, allClusters]);
 
   // ── Visible subsets ──────────────────────────────────────────────────────
   const filterWeight = edgeMode === "strong" ? 2.0 : edgeMode === "semantic" ? 2.5 : 0;
 
   const getVisible = useCallback(() => {
-    const nodes = graphData.nodes.filter(n => n.is_center || activeFilters.has(n.cluster));
-    const ids = new Set(nodes.map(n => n.id));
-    const links = graphData.links.filter(l => {
+    const baseNodes = graphData.nodes.filter(n => n.is_center || effectiveActiveFilters.has(n.cluster));
+    const ids = new Set(baseNodes.map(n => n.id));
+    const nodeById = new Map(baseNodes.map(n => [n.id, n]));
+
+    let links = graphData.links.filter(l => {
       const s = typeof l.source === "object" ? l.source.id : l.source;
       const t = typeof l.target === "object" ? l.target.id : l.target;
       return ids.has(s) && ids.has(t) && (l.weight || 1) >= filterWeight;
     });
-    return { nodes, links };
-  }, [graphData, activeFilters, filterWeight]);
+
+    if (showCrossCommunityOnly) {
+      links = links.filter(l => {
+        const s = typeof l.source === "object" ? l.source.id : l.source;
+        const t = typeof l.target === "object" ? l.target.id : l.target;
+        const sc = nodeById.get(s)?.community_id ?? 0;
+        const tc = nodeById.get(t)?.community_id ?? 0;
+        return sc !== tc;
+      });
+    }
+
+    if (focusOnSelection && selectedNodeId) {
+      links = links.filter(l => {
+        const s = typeof l.source === "object" ? l.source.id : l.source;
+        const t = typeof l.target === "object" ? l.target.id : l.target;
+        return s === selectedNodeId || t === selectedNodeId;
+      });
+    }
+
+    if (focusOnSelection && selectedNodeId) {
+      const focusIds = new Set([selectedNodeId]);
+      links.forEach(l => {
+        const s = typeof l.source === "object" ? l.source.id : l.source;
+        const t = typeof l.target === "object" ? l.target.id : l.target;
+        focusIds.add(s);
+        focusIds.add(t);
+      });
+      return {
+        nodes: baseNodes.filter(n => focusIds.has(n.id)),
+        links,
+      };
+    }
+
+    return { nodes: baseNodes, links };
+  }, [
+    graphData,
+    effectiveActiveFilters,
+    filterWeight,
+    showCrossCommunityOnly,
+    focusOnSelection,
+    selectedNodeId,
+  ]);
 
   const getMatchIds = useCallback(() => {
     if (!searchQ.trim()) return new Set();
@@ -308,22 +363,46 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
     const { nodes: visNodes, links: visLinks } = getVisible();
     const visIds = new Set(visNodes.map(n => n.id));
     const matches = getMatchIds();
+    const connectedToSelected = new Set();
+
+    if (selectedNodeId) {
+      connectedToSelected.add(selectedNodeId);
+      visLinks.forEach(l => {
+        const s = typeof l.source === "object" ? l.source.id : l.source;
+        const t = typeof l.target === "object" ? l.target.id : l.target;
+        if (s === selectedNodeId) connectedToSelected.add(t);
+        if (t === selectedNodeId) connectedToSelected.add(s);
+      });
+    }
 
     nodeElRef.current
       .attr("display", d => visIds.has(d.id) ? null : "none")
       .attr("opacity", d => {
         if (!visIds.has(d.id)) return 0;
+        if (selectedNodeId) {
+          if (d.id === selectedNodeId) return 1;
+          return connectedToSelected.has(d.id) ? 0.92 : 0.08;
+        }
         if (matches.size > 0) return (matches.has(d.id) || d.is_center) ? 1 : 0.08;
         return 1;
       });
 
-    linkElRef.current.attr("display", l => {
-      const s = typeof l.source === "object" ? l.source.id : l.source;
-      const t = typeof l.target === "object" ? l.target.id : l.target;
-      const w = l.weight || 1;
-      return (visIds.has(s) && visIds.has(t) && w >= filterWeight) ? null : "none";
-    });
-  }, [activeFilters, edgeMode, searchQ, getVisible, getMatchIds, filterWeight]);
+    linkElRef.current
+      .attr("display", l => {
+        const s = typeof l.source === "object" ? l.source.id : l.source;
+        const t = typeof l.target === "object" ? l.target.id : l.target;
+        const w = l.weight || 1;
+        return (visIds.has(s) && visIds.has(t) && w >= filterWeight) ? null : "none";
+      })
+      .attr("stroke-opacity", l => {
+        const w = l.weight || 1;
+        const base = w >= 3 ? 0.9 : w >= 2 ? 0.75 : w >= 1 ? 0.45 : 0.2;
+        if (!selectedNodeId) return base;
+        const s = typeof l.source === "object" ? l.source.id : l.source;
+        const t = typeof l.target === "object" ? l.target.id : l.target;
+        return (s === selectedNodeId || t === selectedNodeId) ? 0.98 : 0.06;
+      });
+  }, [activeFilters, edgeMode, searchQ, getVisible, getMatchIds, filterWeight, selectedNodeId]);
 
   // ── Full D3 simulation — only re-runs when graphData or dims change ───────
   useEffect(() => {
@@ -358,6 +437,10 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
     });
 
     const g = svg.append("g");
+    svg.on("click", () => {
+      setSelectedNodeId(null);
+      setFocusOnSelection(false);
+    });
     const zoom = d3.zoom().scaleExtent([0.05, 10])
       .on("zoom", e => g.attr("transform", e.transform));
     svg.call(zoom);
@@ -409,13 +492,25 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
 
     // ── Links ─────────────────────────────────────────────────────────────
     const linkG = g.append("g");
+    const nodeById = new Map(nodes.map(n => [n.id, n]));
+
+    const isCrossCommunity = (l) => {
+      const s = typeof l.source === "object" ? l.source.id : l.source;
+      const t = typeof l.target === "object" ? l.target.id : l.target;
+      const sc = nodeById.get(s)?.community_id ?? 0;
+      const tc = nodeById.get(t)?.community_id ?? 0;
+      return sc !== tc;
+    };
+
     const linkEl = linkG.selectAll("line").data(links).join("line")
       .attr("stroke", l => edgeColor(l.label))
       .attr("stroke-width", l => edgeWidth(l.weight))
       .attr("stroke-opacity", l => {
         const w = l.weight || 1;
-        return w >= 3 ? 0.75 : w >= 2 ? 0.55 : w >= 1 ? 0.35 : 0.12;
+        const base = w >= 3 ? 0.9 : w >= 2 ? 0.75 : w >= 1 ? 0.45 : 0.2;
+        return isCrossCommunity(l) ? Math.min(1, base + 0.15) : base;
       })
+      .attr("stroke-dasharray", l => isCrossCommunity(l) ? "5 3" : null)
       .attr("marker-end", l => {
         const t = typeof l.target === "object" ? l.target : nodes.find(n => n.id === l.target);
         const cid = t?.community_id || 0;
@@ -423,12 +518,12 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
       });
     linkElRef.current = linkEl;
 
-    // Edge labels for strong edges only
-    const strongLinks = links.filter(l => (l.weight || 1) >= 2);
+    // Edge labels for strong edges only (optional, to avoid clutter)
+    const strongLinks = showEdgeLabels ? links.filter(l => (l.weight || 1) >= 2) : [];
     const linkLabelEl = linkG.selectAll("text").data(strongLinks).join("text")
       .attr("text-anchor", "middle").attr("font-size", 8)
       .attr("fill", "var(--text-muted)").attr("pointer-events", "none")
-      .attr("opacity", 0.55)
+      .attr("opacity", 0.8)
       .text(l => (l.label || "").slice(0, 14));
 
     // ── Nodes ─────────────────────────────────────────────────────────────
@@ -466,11 +561,18 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
           });
       })
       .on("mousemove", ev => setTooltip(p => p ? { ...p, x: ev.clientX, y: ev.clientY } : p))
+      .on("click", (ev, d) => {
+        ev.stopPropagation();
+        setSelectedNodeId(prev => (prev === d.id ? null : d.id));
+      })
       .on("mouseout", () => {
         setTooltip(null);
         nodeEl.attr("opacity", 1);
         linkEl
-          .attr("stroke-opacity", l => { const w = l.weight||1; return w>=3?0.75:w>=2?0.55:w>=1?0.35:0.12; })
+          .attr("stroke-opacity", l => {
+            const w = l.weight || 1;
+            return w >= 3 ? 0.9 : w >= 2 ? 0.75 : w >= 1 ? 0.45 : 0.2;
+          })
           .attr("stroke-width", l => edgeWidth(l.weight));
       });
     nodeElRef.current = nodeEl;
@@ -533,8 +635,7 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
 
     return () => simRef.current?.stop();
   // Only full re-render on graphData or dims change — not on filter/search
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [graphData, dims]);
+  }, [graphData, dims, getVisible, showEdgeLabels]);
 
   const handleFit = () => {
     if (!svgRef.current || !zoomRef.current) return;
@@ -551,7 +652,6 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
   };
 
   const { nodes: visNodes, links: visLinks } = getVisible();
-  const allClusters = [...new Set(graphData.nodes.map(n => n.cluster))].filter(c => c !== "CENTER");
   const clusterCounts = Object.fromEntries(allClusters.map(c => [c, graphData.nodes.filter(n => n.cluster === c).length]));
   const matches = getMatchIds();
 
@@ -562,7 +662,7 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
 
   const toggleFilter = (c) => {
     setActiveFilters(prev => {
-      const next = new Set(prev);
+      const next = prev.size ? new Set(prev) : new Set(allClusters);
       if (next.has(c)) { if (next.size > 1) next.delete(c); }
       else next.add(c);
       return next;
@@ -612,6 +712,32 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
           ))}
         </div>
 
+        <div style={{ display: "flex", gap: 4 }}>
+          <button className="btn" onClick={() => setShowCrossCommunityOnly(v => !v)}
+            style={{ padding: "5px 10px", fontSize: 11,
+              background: showCrossCommunityOnly ? "var(--teal-dim)" : "var(--bg-raised)",
+              borderColor: showCrossCommunityOnly ? "var(--teal)" : "var(--border)",
+              color: showCrossCommunityOnly ? "var(--teal)" : "var(--text-muted)" }}>
+            Cross-community
+          </button>
+          <button className="btn" onClick={() => setShowEdgeLabels(v => !v)}
+            style={{ padding: "5px 10px", fontSize: 11,
+              background: showEdgeLabels ? "var(--accent-dim)" : "var(--bg-raised)",
+              borderColor: showEdgeLabels ? "var(--accent-dim2)" : "var(--border)",
+              color: showEdgeLabels ? "var(--accent-light)" : "var(--text-muted)" }}>
+            Edge labels
+          </button>
+          {selectedNodeId && (
+            <button className="btn" onClick={() => setFocusOnSelection(v => !v)}
+              style={{ padding: "5px 10px", fontSize: 11,
+                background: focusOnSelection ? "var(--amber-dim)" : "var(--bg-raised)",
+                borderColor: focusOnSelection ? "var(--amber)" : "var(--border)",
+                color: focusOnSelection ? "var(--amber)" : "var(--text-muted)" }}>
+              Focus selection
+            </button>
+          )}
+        </div>
+
         <div className="graph-stats">
           <span className="graph-stat"><strong>{visNodes.length}</strong> nodes</span>
           <span className="graph-stat"><strong>{visLinks.length}</strong> edges</span>
@@ -648,7 +774,7 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
           <>
             <svg ref={svgRef} width={dims.w} height={dims.h} style={{ display: "block", background: "transparent" }} />
 
-            <ClusterLegend clusters={allClusters} activeFilters={activeFilters} onToggle={toggleFilter} counts={clusterCounts} />
+            <ClusterLegend clusters={allClusters} activeFilters={effectiveActiveFilters} onToggle={toggleFilter} counts={clusterCounts} />
 
             {tooltip && <Tooltip node={tooltip.node} x={tooltip.x} y={tooltip.y} links={graphData.links} />}
 
