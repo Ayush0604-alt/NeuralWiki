@@ -1,6 +1,5 @@
 import { useState, useCallback, useRef } from "react";
 import Upload from "./pages/Upload";
-import SearchBox from "./components/SearchBox";
 import ChatBox from "./components/ChatBox";
 import KnowledgeGraph from "./components/KnowledgeGraph";
 import Wiki from "./components/Wiki";
@@ -9,7 +8,6 @@ import "./App.css";
 const NAV = [
   { id: "chat",   icon: "ti-message-2",    label: "Chat" },
   { id: "wiki",   icon: "ti-book",         label: "Wiki" },
-  { id: "search", icon: "ti-search",       label: "Search" },
   { id: "graph",  icon: "ti-share-2",      label: "Graph" },
   { id: "upload", icon: "ti-cloud-upload", label: "Upload" },
 ];
@@ -99,7 +97,6 @@ export default function App() {
           {/* Wiki auto-refreshes when a document is added or removed */}
           <Wiki onDocumentAdded={onDocumentAdded} onDocumentRemoved={onDocumentRemoved} />
         </div>
-        <div className={`tab-panel${activeTab === "search" ? " active" : ""}`}><SearchBox /></div>
         <div className={`tab-panel${activeTab === "graph"  ? " active" : ""}`}>
           {/* Graph auto-refreshes when a document is added or removed */}
           <KnowledgeGraph onDocumentAdded={onDocumentAdded} onDocumentRemoved={onDocumentRemoved} />

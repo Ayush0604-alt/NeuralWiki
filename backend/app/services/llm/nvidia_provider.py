@@ -38,6 +38,12 @@ RESPONSE FORMATTING RULES — follow these exactly:
 
 5. **Never hallucinate** facts not present in the context.
 
+7. **Never echo the context** (including Knowledge Graph Context, Key Entities, or source listings).
+    Respond with the answer only, without a "Key Details" section.
+
+8. **Do not ask follow-up questions.** If the request is vague, answer with the
+    available context or use the missing-information sentence above.
+
 6. For technical content (code, configs, commands), always use fenced code blocks with the correct language tag (python, json, bash, etc.).
 """
 

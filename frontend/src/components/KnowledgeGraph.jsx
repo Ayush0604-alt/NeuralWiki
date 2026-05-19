@@ -30,10 +30,24 @@ function communityColor(communityId) {
 
 const cfg = (cluster) => CLUSTER_CONFIG[cluster] || CLUSTER_CONFIG.MISC;
 
-// Node radius: degree-driven so genuine hubs are visually prominent
-function nodeRadius(degree, isCenter) {
-  if (isCenter) return Math.max(16, Math.sqrt(degree + 1) * 6);
-  return Math.max(6, Math.sqrt(degree + 1) * 3.5);
+// Extraction method config
+const EXTRACTION_METHODS = {
+  "llm_semantic":   { label: "LLM Semantic", icon: "⚡", color: "#8b84ff" },
+  "svo_verb":       { label: "SVO Verb",     icon: "→", color: "#1fc791" },
+  "co_occurrence":  { label: "Co-occurrence", icon: "○", color: "#ffffff" },
+  "bridge":         { label: "Bridge",       icon: "·", color: "#6b6b80" },
+};
+
+// extractionColor and extractionLabel helpers are available for future enhancements
+
+// Node radius: degree + betweenness-driven for importance
+function nodeRadius(degree, betweenness, isCenter) {
+  const betweennessScore = Math.sqrt(betweenness || 0) * 8;
+  const degreeScore = Math.sqrt(degree + 1) * 3.5;
+  const totalScore = degreeScore + betweennessScore;
+  
+  if (isCenter) return Math.max(18, Math.min(24, totalScore * 2));
+  return Math.max(6, Math.min(16, totalScore));
 }
 
 const EDGE_COLORS = {
@@ -53,7 +67,11 @@ const EDGE_COLORS = {
   "contradicts":     "#ff5c5c",
 };
 
-function edgeColor(label) {
+function edgeColor(label, method) {
+  // Use extraction method color if available for better categorization
+  if (method && EXTRACTION_METHODS[method]) {
+    return EXTRACTION_METHODS[method].color;
+  }
   if (!label) return "#8f98b6";
   const lo = label.toLowerCase();
   for (const [key, col] of Object.entries(EDGE_COLORS)) {
@@ -70,6 +88,7 @@ function edgeWidth(weight) {
   return 0.5;
 }
 
+// Convex hull for community clustering visualization
 // ── Parse flat + legacy formats from API ──────────────────────────────────────
 function parseGraphResponse(rawArray) {
   if (!rawArray?.length) return { nodes: [], links: [], numCommunities: 0 };
@@ -166,8 +185,7 @@ function Tooltip({ node, x, y, links }) {
             {node.id.length > 28 ? node.id.slice(0, 27) + "…" : node.id}
           </div>
           <div style={{ fontSize: 10, color: "var(--text-muted)", letterSpacing: "0.7px" }}>
-            {c.label} · community {node.community_id} · degree {node.degree}
-          </div>
+            {c.label} · community {node.community_id} · degree {node.degree}            {node.betweenness > 0 && ` · centrality ${(node.betweenness * 100).toFixed(1)}%`}          </div>
         </div>
       </div>
       {conns.slice(0, 5).map((l, i) => {
@@ -229,9 +247,7 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
   const [tooltip, setTooltip]       = useState(null);
   const [searchQ, setSearchQ]       = useState("");
   const [activeFilters, setActiveFilters] = useState(new Set());
-  const [edgeMode, setEdgeMode]     = useState("strong");
-  const [showCrossCommunityOnly, setShowCrossCommunityOnly] = useState(false);
-  const [showEdgeLabels, setShowEdgeLabels] = useState(false);
+  const [edgeMode, setEdgeMode]     = useState("all");
   const [selectedNodeId, setSelectedNodeId] = useState(null);
   const [focusOnSelection, setFocusOnSelection] = useState(false);
 
@@ -300,7 +316,6 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
   const getVisible = useCallback(() => {
     const baseNodes = graphData.nodes.filter(n => n.is_center || effectiveActiveFilters.has(n.cluster));
     const ids = new Set(baseNodes.map(n => n.id));
-    const nodeById = new Map(baseNodes.map(n => [n.id, n]));
 
     let links = graphData.links.filter(l => {
       const s = typeof l.source === "object" ? l.source.id : l.source;
@@ -308,26 +323,25 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
       return ids.has(s) && ids.has(t) && (l.weight || 1) >= filterWeight;
     });
 
-    if (showCrossCommunityOnly) {
-      links = links.filter(l => {
-        const s = typeof l.source === "object" ? l.source.id : l.source;
-        const t = typeof l.target === "object" ? l.target.id : l.target;
-        const sc = nodeById.get(s)?.community_id ?? 0;
-        const tc = nodeById.get(t)?.community_id ?? 0;
-        return sc !== tc;
-      });
-    }
+    const linkedIds = new Set();
+    links.forEach(l => {
+      const s = typeof l.source === "object" ? l.source.id : l.source;
+      const t = typeof l.target === "object" ? l.target.id : l.target;
+      linkedIds.add(s);
+      linkedIds.add(t);
+    });
 
+    const prunedNodes = baseNodes.filter(n => n.is_center || linkedIds.has(n.id));
+    const finalNodes = prunedNodes.length ? prunedNodes : baseNodes;
+
+    // Show connections for selected node
     if (focusOnSelection && selectedNodeId) {
+      const focusIds = new Set([selectedNodeId]);
       links = links.filter(l => {
         const s = typeof l.source === "object" ? l.source.id : l.source;
         const t = typeof l.target === "object" ? l.target.id : l.target;
         return s === selectedNodeId || t === selectedNodeId;
       });
-    }
-
-    if (focusOnSelection && selectedNodeId) {
-      const focusIds = new Set([selectedNodeId]);
       links.forEach(l => {
         const s = typeof l.source === "object" ? l.source.id : l.source;
         const t = typeof l.target === "object" ? l.target.id : l.target;
@@ -335,17 +349,16 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
         focusIds.add(t);
       });
       return {
-        nodes: baseNodes.filter(n => focusIds.has(n.id)),
+        nodes: finalNodes.filter(n => focusIds.has(n.id)),
         links,
       };
     }
 
-    return { nodes: baseNodes, links };
+    return { nodes: finalNodes, links };
   }, [
     graphData,
     effectiveActiveFilters,
     filterWeight,
-    showCrossCommunityOnly,
     focusOnSelection,
     selectedNodeId,
   ]);
@@ -453,9 +466,9 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
       n.y = h / 2 + (Math.random() - 0.5) * h * 0.6;
     });
 
-    // Compute node radii from degree
+    // Compute node radii from degree AND betweenness centrality
     nodes.forEach(n => {
-      n._r = nodeRadius(n.degree, n.is_center);
+      n._r = nodeRadius(n.degree, n.betweenness || 0, n.is_center);
     });
 
     // ── Simulation ── no forceCenter (it fights natural clustering) ──────────
@@ -484,7 +497,9 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
         .distanceMax(600)
       )
       .force("collide", d3.forceCollide().radius(d => d._r + 14).strength(0.85))
-      // No forceCenter — communities form organically
+      // Gentle centering to avoid disconnected islands drifting off-canvas
+      .force("x", d3.forceX(w / 2).strength(0.04))
+      .force("y", d3.forceY(h / 2).strength(0.04))
       .alphaDecay(0.012)
       .velocityDecay(0.4);
 
@@ -503,7 +518,7 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
     };
 
     const linkEl = linkG.selectAll("line").data(links).join("line")
-      .attr("stroke", l => edgeColor(l.label))
+      .attr("stroke", l => edgeColor(l.label, l.extraction_method))
       .attr("stroke-width", l => edgeWidth(l.weight))
       .attr("stroke-opacity", l => {
         const w = l.weight || 1;
@@ -517,14 +532,6 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
         return `url(#arr-c${cid})`;
       });
     linkElRef.current = linkEl;
-
-    // Edge labels for strong edges only (optional, to avoid clutter)
-    const strongLinks = showEdgeLabels ? links.filter(l => (l.weight || 1) >= 2) : [];
-    const linkLabelEl = linkG.selectAll("text").data(strongLinks).join("text")
-      .attr("text-anchor", "middle").attr("font-size", 8)
-      .attr("fill", "var(--text-muted)").attr("pointer-events", "none")
-      .attr("opacity", 0.8)
-      .text(l => (l.label || "").slice(0, 14));
 
     // ── Nodes ─────────────────────────────────────────────────────────────
     const nodeG = g.append("g");
@@ -593,6 +600,16 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
       .attr("stroke-width", d => d.is_center ? 2.2 : 1.3)
       .attr("filter", d => d.degree >= 8 ? "url(#glow)" : null);
 
+    // Betweenness centrality badge (★) for hub connectors
+    nodeEl.filter(d => (d.betweenness || 0) > 0.05).append("text")
+      .text("★")
+      .attr("text-anchor", "middle").attr("dominant-baseline", "central")
+      .attr("font-size", d => d.is_center ? 10 : 6)
+      .attr("fill", "#ffd32a")
+      .attr("pointer-events", "none")
+      .attr("x", d => d._r + 3)
+      .attr("y", d => -(d._r + 3));
+
     // Icon (cluster-type shape)
     nodeEl.append("text")
       .text(d => cfg(d.cluster).icon)
@@ -618,9 +635,6 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
       linkEl
         .attr("x1", d => d.source.x).attr("y1", d => d.source.y)
         .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-      linkLabelEl
-        .attr("x", d => ((d.source.x||0)+(d.target.x||0))/2)
-        .attr("y", d => ((d.source.y||0)+(d.target.y||0))/2 - 4);
       nodeEl.attr("transform", d => `translate(${d.x||0},${d.y||0})`);
     });
 
@@ -634,8 +648,7 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
     });
 
     return () => simRef.current?.stop();
-  // Only full re-render on graphData or dims change — not on filter/search
-  }, [graphData, dims, getVisible, showEdgeLabels]);
+  }, [graphData, dims, getVisible]);
 
   const handleFit = () => {
     if (!svgRef.current || !zoomRef.current) return;
@@ -712,31 +725,15 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
           ))}
         </div>
 
-        <div style={{ display: "flex", gap: 4 }}>
-          <button className="btn" onClick={() => setShowCrossCommunityOnly(v => !v)}
+        {selectedNodeId && (
+          <button className="btn" onClick={() => setFocusOnSelection(v => !v)}
             style={{ padding: "5px 10px", fontSize: 11,
-              background: showCrossCommunityOnly ? "var(--teal-dim)" : "var(--bg-raised)",
-              borderColor: showCrossCommunityOnly ? "var(--teal)" : "var(--border)",
-              color: showCrossCommunityOnly ? "var(--teal)" : "var(--text-muted)" }}>
-            Cross-community
+              background: focusOnSelection ? "var(--amber-dim)" : "var(--bg-raised)",
+              borderColor: focusOnSelection ? "var(--amber)" : "var(--border)",
+              color: focusOnSelection ? "var(--amber)" : "var(--text-muted)" }}>
+            Focus selection
           </button>
-          <button className="btn" onClick={() => setShowEdgeLabels(v => !v)}
-            style={{ padding: "5px 10px", fontSize: 11,
-              background: showEdgeLabels ? "var(--accent-dim)" : "var(--bg-raised)",
-              borderColor: showEdgeLabels ? "var(--accent-dim2)" : "var(--border)",
-              color: showEdgeLabels ? "var(--accent-light)" : "var(--text-muted)" }}>
-            Edge labels
-          </button>
-          {selectedNodeId && (
-            <button className="btn" onClick={() => setFocusOnSelection(v => !v)}
-              style={{ padding: "5px 10px", fontSize: 11,
-                background: focusOnSelection ? "var(--amber-dim)" : "var(--bg-raised)",
-                borderColor: focusOnSelection ? "var(--amber)" : "var(--border)",
-                color: focusOnSelection ? "var(--amber)" : "var(--text-muted)" }}>
-              Focus selection
-            </button>
-          )}
-        </div>
+        )}
 
         <div className="graph-stats">
           <span className="graph-stat"><strong>{visNodes.length}</strong> nodes</span>
@@ -793,7 +790,7 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
             )}
 
             {/* Edge type legend */}
-            <div style={{ position: "absolute", bottom: 12, left: 14, background: "var(--bg-surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "8px 14px", display: "flex", gap: 14, alignItems: "center", zIndex: 10 }}>
+            <div style={{ position: "absolute", bottom: 12, left: 14, background: "var(--bg-surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "8px 14px", display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap", zIndex: 10, maxWidth: "calc(100% - 40px)" }}>
               {[
                 { label: "LLM semantic",  color: "#8b84ff", w: 2.2, count: llmEdges },
                 { label: "SVO verb",      color: "#1fc791", w: 1.5, count: svoEdges },
@@ -809,7 +806,9 @@ export default function KnowledgeGraph({ onDocumentAdded, onDocumentRemoved }) {
                   </span>
                 </div>
               ))}
-              <span style={{ fontSize: 10, color: "var(--text-muted)", marginLeft: 4 }}>Node size = degree · Color = community</span>
+              <span style={{ fontSize: 10, color: "var(--text-muted)", marginLeft: 4 }}>
+                Node size = degree+centrality · ★ = hub connector · Color = community
+              </span>
             </div>
           </>
         )}

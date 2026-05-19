@@ -35,9 +35,9 @@ from collections import defaultdict
 
 from app.services.parser_service import parse_document
 from app.services.chunking_service import semantic_chunking
-from app.services.embedding_service import generate_embeddings, generate_embedding
+from app.services.embedding_service import generate_embeddings
 from app.services.vector_service import (
-    store_embeddings, semantic_search, list_documents,
+    store_embeddings, list_documents,
     delete_document, clear_all_documents,
 )
 from app.services.llm.llm_manager import generate_ai_response, generate_graphrag_response
@@ -75,6 +75,8 @@ from app.services.wiki_service import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_MISSING_INFO_SENTENCE = "The uploaded documents do not contain information about this topic."
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -145,17 +147,43 @@ Be concise, accurate, and only use information from the document."""
 
     def _llm(query: str, context: str) -> str:
         if key:
-            client = OpenAI(api_key=key, base_url=base_url)
-            r = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": f"Document: {context}\n\nTask: {query}"},
-                ],
-                temperature=0.2, max_tokens=1500,
-            )
-            return r.choices[0].message.content
-        return generate_gemini_response(query, f"{system}\n\nDocument: {context}\n\nTask: {query}")
+            try:
+                client = OpenAI(api_key=key, base_url=base_url)
+                r = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": f"Document: {context}\n\nTask: {query}"},
+                    ],
+                    temperature=0.2, max_tokens=1500,
+                )
+                return r.choices[0].message.content
+            except Exception as exc:
+                logger.warning("Wiki LLM failed (%s). Falling back to Gemini.", exc)
+        try:
+            gemini_result = generate_gemini_response(query, f"{system}\n\nDocument: {context}\n\nTask: {query}")
+            if isinstance(gemini_result, str) and gemini_result.strip().startswith("**Error:**"):
+                raise RuntimeError(gemini_result.strip())
+            return gemini_result
+        except Exception as exc:
+            logger.warning("Gemini wiki fallback failed (%s).", exc)
+
+        if CHAT_API_KEY:
+            try:
+                client = OpenAI(api_key=CHAT_API_KEY, base_url=CHAT_API_BASE_URL)
+                r = client.chat.completions.create(
+                    model=CHAT_MODEL,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": f"Document: {context}\n\nTask: {query}"},
+                    ],
+                    temperature=0.2, max_tokens=1500,
+                )
+                return r.choices[0].message.content
+            except Exception as exc:
+                logger.warning("Chat API wiki fallback failed (%s).", exc)
+
+        return "**Error:** Could not reach any wiki LLM provider. Please check API keys."
     return _llm
 
 
@@ -414,18 +442,6 @@ async def clear_all():
     }
 
 
-# ── Search ────────────────────────────────────────────────────────────────────
-
-@router.get("/search")
-async def search(query: str):
-    q = (query or "").strip()
-    if not q:
-        raise HTTPException(status_code=400, detail="Query must not be empty")
-    qe = generate_embedding(q)
-    results = semantic_search(qe)
-    return {"success": True, "query": q, "total_results": len(results), "results": results}
-
-
 # ── Chat (non-streaming) ──────────────────────────────────────────────────────
 
 @router.post("/chat")
@@ -514,6 +530,62 @@ async def chat_stream(request: Request, body: dict):
 
         ctx = _build_graphrag_context(query, retrieval, history)
 
+        def _strip_missing_sentence(text: str) -> str:
+            if not text:
+                return text
+            stripped = text.strip()
+            if stripped == _MISSING_INFO_SENTENCE:
+                return stripped
+            variants = [
+                _MISSING_INFO_SENTENCE,
+                f"> {_MISSING_INFO_SENTENCE}",
+                f">{_MISSING_INFO_SENTENCE}",
+            ]
+            if any(v in text for v in variants):
+                cleaned = text
+                for v in variants:
+                    cleaned = cleaned.replace(v, "")
+                cleaned = cleaned.strip()
+                return cleaned if cleaned else stripped
+            return text
+
+        def _strip_graph_sections(text: str) -> str:
+            prefixes = (
+                "Supporting Details",
+                "Key Details from the Context",
+                "Key Details",
+                "Entity Relationships",
+                "Relationships",
+                "Multi-hop Reasoning Paths",
+                "Key Entities",
+                "Key Entities in Context",
+                "Sources",
+                "Source",
+            )
+            lines = text.splitlines()
+            out: list[str] = []
+            skipping = False
+            for line in lines:
+                stripped_line = line.strip()
+                if any(stripped_line.startswith(p) for p in prefixes):
+                    skipping = True
+                    continue
+                if skipping:
+                    if not stripped_line:
+                        continue
+                    if stripped_line.startswith(("-", "•", "●", "+")):
+                        continue
+                    if stripped_line.endswith(":"):
+                        continue
+                    skipping = False
+                if not skipping:
+                    out.append(line)
+            cleaned = "\n".join(out).strip()
+            return cleaned if cleaned else text
+
+        def _sanitize_stream_text(text: str) -> str:
+            return _strip_graph_sections(_strip_missing_sentence(text))
+
         try:
             if CHAT_API_KEY:
                 from openai import OpenAI
@@ -531,10 +603,10 @@ async def chat_stream(request: Request, body: dict):
                     delta = chunk.choices[0].delta.content or ""
                     if delta:
                         full += delta
-                        yield f"data: {json.dumps({'type':'token','content':delta})}\n\n"
             else:
                 full = generate_gemini_response(query, f"Context:\n{ctx}\n\nQuestion:\n{query}")
-                yield f"data: {json.dumps({'type':'token','content':full})}\n\n"
+            full = _sanitize_stream_text(full)
+            yield f"data: {json.dumps({'type':'token','content':full})}\n\n"
 
             add_message("AI", full)
             subgraph = _build_subgraph(retrieval["seed_entities"]) if retrieval["seed_entities"] else {"nodes":[],"links":[]}

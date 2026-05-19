@@ -8,21 +8,72 @@ how to use graph relationships for multi-hop inference.
 
 from app.services.llm.nvidia_provider import generate_nvidia_response
 
+_MISSING_INFO_SENTENCE = "The uploaded documents do not contain information about this topic."
+_GRAPH_SECTION_PREFIXES = (
+    "Supporting Details",
+    "Key Details from the Context",
+    "Key Details",
+    "Entity Relationships",
+    "Relationships",
+    "Multi-hop Reasoning Paths",
+    "Multi-hop",
+    "Key Entities",
+    "Key Entities Involved",
+    "Key Entities in Context",
+    "Entities:",
+    "entities:",
+    "Graph only",
+    "Sources",
+    "Source",
+    "Detected query entities",
+)
+
+
+def _sanitize_response(text: str) -> str:
+    if not text:
+        return text
+    stripped = text.strip()
+    if stripped == _MISSING_INFO_SENTENCE:
+        return stripped
+    variants = [
+        _MISSING_INFO_SENTENCE,
+        f"> {_MISSING_INFO_SENTENCE}",
+        f">{_MISSING_INFO_SENTENCE}",
+    ]
+    if any(v in text for v in variants):
+        cleaned = text
+        for v in variants:
+            cleaned = cleaned.replace(v, "")
+        cleaned = cleaned.strip()
+        text = cleaned if cleaned else stripped
+
+    lines = text.splitlines()
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        stripped_line = line.strip()
+        if any(stripped_line.startswith(p) for p in _GRAPH_SECTION_PREFIXES):
+            skipping = True
+            continue
+        if skipping:
+            if not stripped_line:
+                continue
+            if stripped_line.startswith(("-", "•", "●", "+")):
+                continue
+            if stripped_line.endswith(":"):
+                continue
+            skipping = False
+        if not skipping:
+            out.append(line)
+
+    cleaned = "\n".join(out).strip()
+    return cleaned if cleaned else text
+
 
 # Extra guidance injected when graph context is present
 _GRAPHRAG_ADDENDUM = """
-You also have access to a **Knowledge Graph context** section containing:
-- Entity relationships as triples:  `Entity A → [relationship] → Entity B`
-- Multi-hop reasoning paths connecting entities across documents
-- Key entity metadata (type, frequency)
-
-**How to use the Knowledge Graph:**
-- Use triples to reason about HOW entities relate to each other
-- Follow multi-hop paths to answer questions that require chaining facts
-  (e.g. if A → [uses] → B and B → [integrates_with] → C, then A indirectly
-   relates to C)
-- Cite graph relationships when they directly support your answer
-- If graph triples and text chunks conflict, prefer the text chunks
+You have access to knowledge graph context. Use it to provide accurate, 
+well-informed answers. Focus on answering the user's question clearly and concisely.
 """
 
 
@@ -37,7 +88,8 @@ def generate_ai_response(query: str, context: str, history: str) -> str:
 Retrieved Knowledge:
 {context}
 """
-    return generate_nvidia_response(query, final_context)
+    response = generate_nvidia_response(query, final_context)
+    return _sanitize_response(response)
 
 
 def generate_graphrag_response(
@@ -72,4 +124,5 @@ def generate_graphrag_response(
 Retrieved Knowledge (Vector Chunks + Knowledge Graph Triples):
 {enriched_context}
 """
-    return generate_nvidia_response(query, final_context)
+    response = generate_nvidia_response(query, final_context)
+    return _sanitize_response(response)

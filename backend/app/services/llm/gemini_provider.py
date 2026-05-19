@@ -35,6 +35,12 @@ RESPONSE FORMATTING RULES — follow these exactly:
    > The uploaded documents do not contain information about this topic.
 
 5. Never invent facts not present in the context.
+
+6. Never echo the context (Knowledge Graph Context, Key Entities, or source listings).
+    Respond with the answer only, without a "Key Details" section.
+
+7. Do not ask follow-up questions. If the request is vague, answer with the
+    available context or use the missing-information sentence above.
 """
 
 

@@ -453,8 +453,8 @@ def get_full_graph_for_frontend() -> list[dict]:
 
     2. Flat node-link format appended as the last list entry under key "_flat":
        {"_flat": True, "nodes": [...], "links": [...]}
-       Nodes carry: id, cluster, community_id, degree, freq, doc_ids
-       Links carry: source, target, label, weight
+       Nodes carry: id, cluster, community_id, degree, freq, doc_ids, betweenness
+       Links carry: source, target, label, weight, extraction_method
 
     KnowledgeGraph.jsx should check for the _flat entry and prefer it.
     Cross-document relationships are only visible in the flat format.
@@ -462,18 +462,25 @@ def get_full_graph_for_frontend() -> list[dict]:
     if _G.number_of_nodes() == 0:
         return []
 
-    # ── Compute degree for all nodes ──────────────────────────────────────────
+    # ── Compute degree and betweenness centrality for all nodes ────────────────
     degree_map = dict(_G.degree())
+    try:
+        betweenness_map = nx.betweenness_centrality(_G.to_undirected())
+    except Exception:
+        betweenness_map = {n: 0.0 for n in _G.nodes()}
 
     # ── Build flat node list ───────────────────────────────────────────────────
     flat_nodes = []
     for nid, data in _G.nodes(data=True):
         meta = _entity_meta.get(nid, {})
+        degree = degree_map.get(nid, 0)
+        betweenness = betweenness_map.get(nid, 0.0)
         flat_nodes.append({
             "id":          nid,
             "cluster":     data.get("cluster", "MISC"),
             "community_id": _community_map.get(nid, 0),
-            "degree":      degree_map.get(nid, 0),
+            "degree":      degree,
+            "betweenness": round(betweenness, 6),
             "freq":        meta.get("freq", 1),
             "doc_ids":     data.get("doc_ids", []),
             "is_center":   bool(data.get("is_center", False)),
@@ -487,11 +494,22 @@ def get_full_graph_for_frontend() -> list[dict]:
         if key in seen_pairs:
             continue
         seen_pairs.add(key)
+        weight = edata.get("weight", 1.0)
+        # Determine extraction method from weight
+        if weight >= 3:
+            extraction_method = "llm_semantic"
+        elif weight >= 2:
+            extraction_method = "svo_verb"
+        elif weight >= 1:
+            extraction_method = "co_occurrence"
+        else:
+            extraction_method = "bridge"
         flat_links.append({
             "source": src,
             "target": tgt,
             "label":  edata.get("label", "related_to"),
-            "weight": edata.get("weight", 1.0),
+            "weight": weight,
+            "extraction_method": extraction_method,
         })
 
     # ── Legacy document-segmented format ──────────────────────────────────────
