@@ -34,9 +34,12 @@ import re
 from collections import defaultdict
 from itertools import combinations
 
+from dotenv import load_dotenv
 import spacy
 
 logger = logging.getLogger(__name__)
+
+load_dotenv()
 
 # ── Optional fuzzy dedup ───────────────────────────────────────────────────────
 try:
@@ -51,10 +54,93 @@ except ImportError:
         logger.warning("rapidfuzz/thefuzz not installed — basic dedup only.")
 
 # ── LLM config ────────────────────────────────────────────────────────────────
-_NVIDIA_KEY = os.getenv("NVIDIA_API_KEY")
-_LLM_EXTRACTION_ENABLED = bool(_NVIDIA_KEY)
+_EXTRACT_API_KEY = os.getenv("EXTRACT_API_KEY") or os.getenv("MISTRAL_API_KEY")
+_EXTRACT_API_BASE_URL = os.getenv("EXTRACT_API_BASE_URL") or "https://api.mistral.ai/v1"
+_EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "mistral-small-latest")
+_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+_LLM_EXTRACTION_ENABLED = bool(_EXTRACT_API_KEY or _GEMINI_API_KEY)
 if not _LLM_EXTRACTION_ENABLED:
-    logger.warning("NVIDIA_API_KEY not set — LLM entity/relation extraction disabled")
+    logger.warning("EXTRACT_API_KEY and GEMINI_API_KEY are both missing — LLM entity/relation extraction disabled")
+else:
+    logger.info("LLM extraction enabled using %s", "EXTRACT_API_KEY" if _EXTRACT_API_KEY else "GEMINI_API_KEY")
+
+
+def _extract_client():
+    from openai import OpenAI
+    return OpenAI(api_key=_EXTRACT_API_KEY, base_url=_EXTRACT_API_BASE_URL, max_retries=0)
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "429" in message
+        or "rate limit" in message
+        or "capacity exceeded" in message
+        or "service_tier_capacity_exceeded" in message
+    )
+
+
+def _gemini_entity_fallback(text: str) -> list[dict]:
+    if not _GEMINI_API_KEY:
+        return []
+    try:
+        from app.services.llm.gemini_provider import generate_gemini_response
+
+        raw = generate_gemini_response("Extract entities", _LLM_ENTITY_PROMPT.format(text=text[:2500]), model=_GEMINI_MODEL)
+        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = _json.loads(raw)
+        if not isinstance(parsed, list):
+            return []
+        out: list[dict] = []
+        seen: set[str] = set()
+        for item in parsed:
+            text_val = str(item.get("text", "")).strip()
+            type_val = str(item.get("type", "OTHER")).upper()
+            if len(text_val) < 2 or text_val.lower() in seen:
+                continue
+            seen.add(text_val.lower())
+            out.append({"text": text_val, "label": type_val, "_cluster": _LLM_TYPE_TO_CLUSTER.get(type_val, "MISC"), "_source": "gemini"})
+        return out
+    except Exception as exc:
+        logger.warning("Gemini entity fallback failed: %s", exc)
+        return []
+
+
+def _gemini_relationship_fallback(text: str, known: set[str], dm: dict[str, str]) -> list[dict]:
+    if not _GEMINI_API_KEY or len(known) < 2:
+        return []
+    try:
+        from app.services.llm.gemini_provider import generate_gemini_response
+
+        raw = generate_gemini_response("Extract relationships", _LLM_REL_PROMPT.format(entities=", ".join(sorted(known)[:40]), text=text[:2000]), model=_GEMINI_MODEL)
+        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = _json.loads(raw)
+        if not isinstance(parsed, list):
+            return []
+        out: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        for r in parsed:
+            src_raw = str(r.get("source", "")).strip()
+            tgt_raw = str(r.get("target", "")).strip()
+            label = str(r.get("label", "")).strip()
+            if not src_raw or not tgt_raw or not label:
+                continue
+            src = dm.get(src_raw, src_raw)
+            tgt = dm.get(tgt_raw, tgt_raw)
+            if src not in known or tgt not in known or src == tgt:
+                continue
+            key = (min(src, tgt), max(src, tgt), label)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"source": src, "target": tgt, "label": label, "weight": 3.0})
+        return out
+    except Exception as exc:
+        logger.warning("Gemini relationship fallback failed: %s", exc)
+        return []
 
 try:
     nlp = spacy.load("en_core_web_sm")
@@ -170,8 +256,7 @@ def _llm_extract_entities(text: str, window_size: int = 2500) -> list[dict]:
     if not _LLM_EXTRACTION_ENABLED:
         return []
 
-    from openai import OpenAI
-    client = OpenAI(api_key=_NVIDIA_KEY, base_url="https://integrate.api.nvidia.com/v1")
+    client = _extract_client() if _EXTRACT_API_KEY else None
 
     # Split into sentence-aware windows
     sentences = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
@@ -189,20 +274,24 @@ def _llm_extract_entities(text: str, window_size: int = 2500) -> list[dict]:
 
     all_entities: list[dict] = []
     seen: set[str] = set()
+    hit_rate_limit = False
 
     for window in windows[:20]:  # cap at 20 windows (~50k chars)
         prompt = _LLM_ENTITY_PROMPT.format(text=window[:2500])
         try:
-            resp = client.chat.completions.create(
-                model="meta/llama-3.1-70b-instruct",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=600,
-            )
-            raw = resp.choices[0].message.content.strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            parsed = _json.loads(raw)
+            if client is not None:
+                resp = client.chat.completions.create(
+                    model=_EXTRACT_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=600,
+                )
+                raw = resp.choices[0].message.content.strip()
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+                parsed = _json.loads(raw)
+            else:
+                parsed = []
             if not isinstance(parsed, list):
                 continue
             for item in parsed:
@@ -223,6 +312,12 @@ def _llm_extract_entities(text: str, window_size: int = 2500) -> list[dict]:
                 })
         except Exception as exc:
             logger.warning("LLM entity extraction failed for window: %s", exc)
+            if _is_rate_limit_error(exc):
+                hit_rate_limit = True
+                break
+
+    if hit_rate_limit or not all_entities:
+        all_entities = _gemini_entity_fallback(text)
 
     logger.info("LLM entity extraction: %d entities across %d windows", len(all_entities), len(windows))
     return all_entities
@@ -418,8 +513,7 @@ def _llm_extract_relationships(
     if not _LLM_EXTRACTION_ENABLED or len(known) < 2:
         return []
 
-    from openai import OpenAI
-    client = OpenAI(api_key=_NVIDIA_KEY, base_url="https://integrate.api.nvidia.com/v1")
+    client = _extract_client() if _EXTRACT_API_KEY else None
 
     sentences = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
     windows: list[str] = []
@@ -437,19 +531,23 @@ def _llm_extract_relationships(
     entity_list = sorted(known)
     all_rels: list[dict] = []
     seen_pairs: set[tuple] = set()
+    hit_rate_limit = False
 
     for window in windows[:12]:
         prompt = _LLM_REL_PROMPT.format(entities=", ".join(entity_list[:40]), text=window[:2000])
         try:
-            resp = client.chat.completions.create(
-                model="meta/llama-3.1-70b-instruct",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0, max_tokens=800,
-            )
-            raw = resp.choices[0].message.content.strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            parsed = _json.loads(raw)
+            if client is not None:
+                resp = client.chat.completions.create(
+                    model=_EXTRACT_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0, max_tokens=800,
+                )
+                raw = resp.choices[0].message.content.strip()
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+                parsed = _json.loads(raw)
+            else:
+                parsed = []
             if not isinstance(parsed, list):
                 continue
             for r in parsed:
@@ -469,6 +567,12 @@ def _llm_extract_relationships(
                 all_rels.append({"source": src, "target": tgt, "label": label, "weight": 3.0})
         except Exception as exc:
             logger.warning("LLM relationship extraction failed: %s", exc)
+            if _is_rate_limit_error(exc):
+                hit_rate_limit = True
+                break
+
+    if hit_rate_limit or not all_rels:
+        all_rels = _gemini_relationship_fallback(text, known, dm)
 
     logger.info("LLM relationship extraction: %d relationships across %d windows",
                 len(all_rels), len(windows))
@@ -540,11 +644,11 @@ def _keyword_fallback(text: str, existing: set[str], max_extra: int = 20) -> lis
 # Main extraction entry point — REVISED PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_entities_and_relationships(text: str) -> dict:
+def extract_entities_and_relationships(text: str, use_llm: bool = True) -> dict:
     """
     Revised extraction pipeline:
 
-    1. LLM entity extraction (Layer 0) — runs FIRST for domain coverage
+    1. LLM entity extraction (Layer 0) — runs FIRST for domain coverage when enabled
     2. spaCy NER supplements LLM entities (adds news-text entities cheaply)
     3. spaCy noun-chunk supplement for TECH/CONCEPT/ACTION keywords
     4. Keyword fallback if entity count still low
@@ -559,7 +663,7 @@ def extract_entities_and_relationships(text: str) -> dict:
     logger.info("Doc type: %s", doc_type)
 
     # ── Layer 0: LLM entity extraction (PRIMARY) ───────────────────────────────
-    llm_entities = _llm_extract_entities(text_sample)
+    llm_entities = _llm_extract_entities(text_sample) if use_llm else []
     seen: set[str] = {e["text"].lower() for e in llm_entities}
     raw_entities: list[dict] = list(llm_entities)
 
@@ -611,7 +715,7 @@ def extract_entities_and_relationships(text: str) -> dict:
     cooc_rels = _cooccurrence_extract(doc, known_set, dm, min_cooccur=2)
 
     # ── Layer 3: LLM relationship extraction ──────────────────────────────────
-    llm_rels = _llm_extract_relationships(text_sample, known_set, dm)
+    llm_rels = _llm_extract_relationships(text_sample, known_set, dm) if use_llm else []
 
     # ── Merge (LLM > SVO > co-occurrence) ────────────────────────────────────
     merged_rels: list[dict] = []

@@ -2,14 +2,14 @@ import os
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from app.services.llm.gemini_provider import generate_gemini_response
+
 load_dotenv()
 
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-
-client = OpenAI(
-    api_key=NVIDIA_API_KEY,
-    base_url="https://integrate.api.nvidia.com/v1"
-)
+CHAT_API_KEY = os.getenv("CHAT_API_KEY") or os.getenv("NVIDIA_API_KEY")
+CHAT_API_BASE_URL = os.getenv("CHAT_API_BASE_URL") or "https://integrate.api.nvidia.com/v1"
+CHAT_MODEL = os.getenv("CHAT_MODEL", "nvidia/llama-3.1-nemotron-nano-8b-v1")
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 SYSTEM_PROMPT = """You are NeuralWiki, an AI assistant that answers questions using retrieved document context.
 
@@ -51,18 +51,26 @@ User question:
 {query}
 """
 
-    try:
-        completion = client.chat.completions.create(
-            model="meta/llama-3.1-70b-instruct",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=1024,
-        )
-        return completion.choices[0].message.content
+    if CHAT_API_KEY:
+        try:
+            client = OpenAI(api_key=CHAT_API_KEY, base_url=CHAT_API_BASE_URL)
+            completion = client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=1024,
+            )
+            return completion.choices[0].message.content
+        except Exception as error:
+            print("NVIDIA ERROR:", error)
 
-    except Exception as error:
-        print("NVIDIA ERROR:", error)
-        return "**Error:** Could not reach the NVIDIA API. Please check your API key and try again."
+    if os.getenv("GEMINI_API_KEY"):
+        try:
+            return generate_gemini_response(query, context, model=GEMINI_FALLBACK_MODEL)
+        except Exception as error:
+            print("Gemini fallback error:", error)
+
+    return "**Error:** Could not reach the chat API. Please check your API key and try again."

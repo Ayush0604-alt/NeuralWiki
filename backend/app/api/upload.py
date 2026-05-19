@@ -41,7 +41,13 @@ from app.services.vector_service import (
     delete_document, clear_all_documents,
 )
 from app.services.llm.llm_manager import generate_ai_response, generate_graphrag_response
-from app.services.llm.nvidia_provider import NVIDIA_API_KEY, SYSTEM_PROMPT as NVIDIA_SYSTEM_PROMPT
+from app.services.llm.gemini_provider import generate_gemini_response
+from app.services.llm.nvidia_provider import (
+    SYSTEM_PROMPT as NVIDIA_SYSTEM_PROMPT,
+    CHAT_API_KEY,
+    CHAT_API_BASE_URL,
+    CHAT_MODEL,
+)
 from app.services.memory_service import add_message, get_conversation_history, clear_memory
 
 from app.services.knowledge_graph_service import (
@@ -128,10 +134,9 @@ def _delete_upload_file(filename: str) -> bool:
 
 def _make_wiki_llm():
     from openai import OpenAI
-    key = os.getenv("NVIDIA_API_KEY")
-    if not key:
-        raise RuntimeError("NVIDIA_API_KEY not set")
-    client = OpenAI(api_key=key, base_url="https://integrate.api.nvidia.com/v1")
+    key = os.getenv("WIKI_API_KEY") or os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
+    base_url = os.getenv("WIKI_API_BASE_URL") or "https://api.x.ai/v1"
+    model = os.getenv("WIKI_MODEL", "grok-2-latest")
     system = """You are NeuralWiki, an expert knowledge base curator.
 Generate a structured wiki page in Markdown with sections:
 ## Overview, ## Key Concepts, ## Notable Entities, ## Key Facts & Findings,
@@ -139,15 +144,18 @@ Generate a structured wiki page in Markdown with sections:
 Be concise, accurate, and only use information from the document."""
 
     def _llm(query: str, context: str) -> str:
-        r = client.chat.completions.create(
-            model="meta/llama-3.1-70b-instruct",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": f"Document: {context}\n\nTask: {query}"},
-            ],
-            temperature=0.2, max_tokens=1500,
-        )
-        return r.choices[0].message.content
+        if key:
+            client = OpenAI(api_key=key, base_url=base_url)
+            r = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": f"Document: {context}\n\nTask: {query}"},
+                ],
+                temperature=0.2, max_tokens=1500,
+            )
+            return r.choices[0].message.content
+        return generate_gemini_response(query, f"{system}\n\nDocument: {context}\n\nTask: {query}")
     return _llm
 
 
@@ -245,7 +253,7 @@ def _build_graphrag_context(query: str, retrieval: dict, history: str) -> str:
 # ── Upload ────────────────────────────────────────────────────────────────────
 
 @router.post("/upload")
-async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...), background: bool = False, fast: bool = False):
     raw_name = file.filename or "upload.bin"
     filename = _sanitize_filename(raw_name)
     ext = os.path.splitext(filename)[1].lower()
@@ -271,66 +279,52 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
     with open(file_path, "wb") as f:
         f.write(content)
 
-    try:
-        # ── Fix 2: parse_document now returns a dict ───────────────────────
+    # If background processing requested, schedule and return immediately
+    def _process_file(fname: str, use_llm: bool = True):
+        file_path = os.path.join(UPLOAD_DIR, fname)
         parsed = parse_document(file_path)
         if not parsed or not parsed.get("text", "").strip():
             raise ValueError("Document is empty or could not be parsed.")
-
         extracted_text = parsed["text"]
-        pages          = parsed.get("pages", [])
-        doc_meta       = {
-            "title":       parsed.get("title",       filename),
+        pages = parsed.get("pages", [])
+        doc_meta = {
+            "title":       parsed.get("title",       fname),
             "author":      parsed.get("author",       ""),
             "created_at":  parsed.get("created_at",   ""),
             "total_pages": parsed.get("total_pages",  1),
         }
 
-        # ── Fix 1: sentence-aware chunking with overlap ────────────────────
         chunks = semantic_chunking(extracted_text)
-
-        # ── Fix 2: annotate each chunk with its source page + heading ──────
         chunks = _annotate_chunks_with_pages(chunks, pages)
 
-        # ── Fix 3: LLM-first entity extraction (transparent inside here) ──
-        graph_data = extract_entities_and_relationships(extracted_text)
-        dedup_map  = graph_data.pop("_dedup_map", {})
+        graph_data = extract_entities_and_relationships(extracted_text, use_llm=use_llm)
+        dedup_map = graph_data.pop("_dedup_map", {})
 
-        # Link entities to chunks BEFORE embedding
         chunks = link_entities_to_chunks(chunks, graph_data["entities"], dedup_map)
-
-        # Embed
         embedded_chunks = generate_embeddings(chunks)
-
-        # ── Fix 2: store with full doc_meta so page fields hit ChromaDB ───
-        store_embeddings(filename, embedded_chunks, doc_meta=doc_meta)
-
-        # Legacy graph store
+        store_embeddings(fname, embedded_chunks, doc_meta=doc_meta)
         store_knowledge_graph(graph_data)
-
-        # GraphRAG persistent graph
         ingest_document_graph(
-            doc_id=filename,
+            doc_id=fname,
             center=graph_data.get("center", {}),
             clusters=graph_data.get("clusters", {}),
             relationships=graph_data.get("relationships", []),
             doc_type=graph_data.get("doc_type", "general"),
         )
 
-        # Wiki runs in background so upload returns immediately
-        background_tasks.add_task(_background_wiki, filename, extracted_text)
+        # Wiki runs in background
+        background_tasks.add_task(_background_wiki, fname, extracted_text)
 
         total_links = sum(len(c.get("entities", [])) for c in embedded_chunks)
         logger.info(
             "Uploaded '%s': %d chunks, %d entities, %d rels, %d links, %d merges, %d pages",
-            filename, len(embedded_chunks), len(graph_data["entities"]),
+            fname, len(embedded_chunks), len(graph_data["entities"]),
             len(graph_data["relationships"]), total_links, len(dedup_map),
             doc_meta["total_pages"],
         )
-
         return {
             "success":             True,
-            "filename":            filename,
+            "filename":            fname,
             "file_size_kb":        round(len(content) / 1024, 1),
             "chunks_stored":       len(embedded_chunks),
             "entities_found":      len(graph_data["entities"]),
@@ -340,9 +334,22 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
             "doc_title":           doc_meta["title"],
             "total_pages":         doc_meta["total_pages"],
             "wiki_generated":      False,
-            "message":             "Document processed successfully. Wiki generating in background.",
+            "message":             "Document processed successfully (background=%s, fast=%s)." % (background, fast),
         }
 
+    use_llm = not bool(fast)
+    if background:
+        # schedule background processing, return 202 accepted
+        background_tasks.add_task(_process_file, filename, use_llm)
+        return {
+            "success": True,
+            "filename": filename,
+            "message": "Upload accepted and processing scheduled in background.",
+        }
+
+    try:
+        result = _process_file(filename, use_llm)
+        return result
     except Exception:
         logger.exception("Processing failed for '%s'", filename)
         _delete_upload_file(filename)
@@ -505,30 +512,29 @@ async def chat_stream(request: Request, body: dict):
             yield f"data: {json.dumps({'type':'done'})}\n\n"
             return
 
-        key = os.getenv("NVIDIA_API_KEY")
-        if not key:
-            yield f"data: {json.dumps({'type':'error','content':'NVIDIA_API_KEY not configured.'})}\n\n"
-            return
-
         ctx = _build_graphrag_context(query, retrieval, history)
 
         try:
-            from openai import OpenAI
-            client = OpenAI(api_key=key, base_url="https://integrate.api.nvidia.com/v1")
-            full = ""
-            stream = client.chat.completions.create(
-                model="meta/llama-3.1-70b-instruct",
-                messages=[
-                    {"role": "system", "content": NVIDIA_SYSTEM_PROMPT},
-                    {"role": "user",   "content": f"Context:\n{ctx}\n\nQuestion:\n{query}"},
-                ],
-                temperature=0.3, max_tokens=1024, stream=True,
-            )
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content or ""
-                if delta:
-                    full += delta
-                    yield f"data: {json.dumps({'type':'token','content':delta})}\n\n"
+            if CHAT_API_KEY:
+                from openai import OpenAI
+                client = OpenAI(api_key=CHAT_API_KEY, base_url=CHAT_API_BASE_URL)
+                full = ""
+                stream = client.chat.completions.create(
+                    model=CHAT_MODEL,
+                    messages=[
+                        {"role": "system", "content": NVIDIA_SYSTEM_PROMPT},
+                        {"role": "user",   "content": f"Context:\n{ctx}\n\nQuestion:\n{query}"},
+                    ],
+                    temperature=0.3, max_tokens=1024, stream=True,
+                )
+                for chunk in stream:
+                    delta = chunk.choices[0].delta.content or ""
+                    if delta:
+                        full += delta
+                        yield f"data: {json.dumps({'type':'token','content':delta})}\n\n"
+            else:
+                full = generate_gemini_response(query, f"Context:\n{ctx}\n\nQuestion:\n{query}")
+                yield f"data: {json.dumps({'type':'token','content':full})}\n\n"
 
             add_message("AI", full)
             subgraph = _build_subgraph(retrieval["seed_entities"]) if retrieval["seed_entities"] else {"nodes":[],"links":[]}
