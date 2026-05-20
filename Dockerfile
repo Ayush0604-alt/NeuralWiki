@@ -3,10 +3,14 @@ FROM python:3.13
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies for compiling packages with C/C++ extensions
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
+    python3-dev \
+    libopenblas-dev \
+    liblapack-dev \
+    gfortran \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy backend files
