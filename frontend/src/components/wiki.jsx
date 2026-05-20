@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
-import { API_BASE_URL as API } from "../api/config";
+
+const API = "http://127.0.0.1:8000";
 
 // ── Markdown renderer ─────────────────────────────────────────────────────────
 function WikiContent({ text }) {

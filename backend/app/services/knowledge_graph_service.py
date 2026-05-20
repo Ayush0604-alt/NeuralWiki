@@ -93,6 +93,30 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     )
 
 
+def _load_json_array_forgiving(raw: str) -> list | None:
+    """Parse a JSON array from model output that may include fences or extra text."""
+    text = raw.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    decoder = _json.JSONDecoder()
+    for start_char in ("[", "{"):
+        start = text.find(start_char)
+        if start == -1:
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text[start:])
+        except Exception:
+            continue
+        if isinstance(parsed, list):
+            return parsed
+    try:
+        parsed = _json.loads(text)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
 def _nvidia_entity_fallback(text: str) -> list[dict]:
     """NVIDIA fallback for entity extraction."""
     if not _EXTRACT_API_KEY_FALLBACK:
@@ -105,10 +129,8 @@ def _nvidia_entity_fallback(text: str) -> list[dict]:
             temperature=0.0,
             max_tokens=600,
         )
-        raw = resp.choices[0].message.content.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        parsed = _json.loads(raw)
+        raw = resp.choices[0].message.content or ""
+        parsed = _load_json_array_forgiving(raw)
         if not isinstance(parsed, list):
             return []
         out: list[dict] = []
@@ -135,9 +157,7 @@ def _gemini_entity_fallback(text: str) -> list[dict]:
         from app.services.llm.gemini_provider import generate_gemini_response
 
         raw = generate_gemini_response("Extract entities", _LLM_ENTITY_PROMPT.format(text=text[:2500]), model=_GEMINI_MODEL)
-        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-        raw = re.sub(r"\s*```$", "", raw)
-        parsed = _json.loads(raw)
+        parsed = _load_json_array_forgiving(raw)
         if not isinstance(parsed, list):
             return []
         out: list[dict] = []
@@ -167,10 +187,8 @@ def _nvidia_relationship_fallback(text: str, known: set[str], dm: dict[str, str]
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0, max_tokens=800,
         )
-        raw = resp.choices[0].message.content.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        parsed = _json.loads(raw)
+        raw = resp.choices[0].message.content or ""
+        parsed = _load_json_array_forgiving(raw)
         if not isinstance(parsed, list):
             return []
         out: list[dict] = []
@@ -204,9 +222,7 @@ def _gemini_relationship_fallback(text: str, known: set[str], dm: dict[str, str]
         from app.services.llm.gemini_provider import generate_gemini_response
 
         raw = generate_gemini_response("Extract relationships", _LLM_REL_PROMPT.format(entities=", ".join(sorted(known)[:40]), text=text[:2000]), model=_GEMINI_MODEL)
-        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-        raw = re.sub(r"\s*```$", "", raw)
-        parsed = _json.loads(raw)
+        parsed = _load_json_array_forgiving(raw)
         if not isinstance(parsed, list):
             return []
         out: list[dict] = []
@@ -375,10 +391,8 @@ def _llm_extract_entities(text: str, window_size: int = 2500) -> list[dict]:
                     temperature=0.0,
                     max_tokens=600,
                 )
-                raw = resp.choices[0].message.content.strip()
-                raw = re.sub(r"^```(?:json)?\s*", "", raw)
-                raw = re.sub(r"\s*```$", "", raw)
-                parsed = _json.loads(raw)
+                raw = resp.choices[0].message.content or ""
+                parsed = _load_json_array_forgiving(raw)
             else:
                 parsed = []
             if not isinstance(parsed, list):
@@ -635,10 +649,8 @@ def _llm_extract_relationships(
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0, max_tokens=800,
                 )
-                raw = resp.choices[0].message.content.strip()
-                raw = re.sub(r"^```(?:json)?\s*", "", raw)
-                raw = re.sub(r"\s*```$", "", raw)
-                parsed = _json.loads(raw)
+                raw = resp.choices[0].message.content or ""
+                parsed = _load_json_array_forgiving(raw)
             else:
                 parsed = []
             if not isinstance(parsed, list):
