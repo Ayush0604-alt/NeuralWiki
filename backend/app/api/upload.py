@@ -41,7 +41,6 @@ from app.services.vector_service import (
     delete_document, clear_all_documents,
 )
 from app.services.llm.llm_manager import generate_ai_response, generate_graphrag_response
-from app.services.llm.gemini_provider import generate_gemini_response
 from app.services.llm.nvidia_provider import (
     SYSTEM_PROMPT as NVIDIA_SYSTEM_PROMPT,
     CHAT_API_KEY,
@@ -139,6 +138,12 @@ def _make_wiki_llm():
     key = os.getenv("WIKI_API_KEY") or os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
     base_url = os.getenv("WIKI_API_BASE_URL") or "https://api.x.ai/v1"
     model = os.getenv("WIKI_MODEL", "grok-2-latest")
+    
+    # Fallback NVIDIA keys
+    fallback_key = os.getenv("CHAT_API_KEY_FALLBACK") or CHAT_API_KEY
+    fallback_base_url = os.getenv("CHAT_API_BASE_URL_FALLBACK") or CHAT_API_BASE_URL
+    fallback_model = os.getenv("CHAT_MODEL_FALLBACK") or CHAT_MODEL
+    
     system = """You are NeuralWiki, an expert knowledge base curator.
 Generate a structured wiki page in Markdown with sections:
 ## Overview, ## Key Concepts, ## Notable Entities, ## Key Facts & Findings,
@@ -146,6 +151,7 @@ Generate a structured wiki page in Markdown with sections:
 Be concise, accurate, and only use information from the document."""
 
     def _llm(query: str, context: str) -> str:
+        # First attempt: X.ai/Grok (grok-4.3)
         if key:
             try:
                 client = OpenAI(api_key=key, base_url=base_url)
@@ -157,17 +163,12 @@ Be concise, accurate, and only use information from the document."""
                     ],
                     temperature=0.2, max_tokens=1500,
                 )
+                logger.info("Wiki LLM succeeded with %s", model)
                 return r.choices[0].message.content
             except Exception as exc:
-                logger.warning("Wiki LLM failed (%s). Falling back to Gemini.", exc)
-        try:
-            gemini_result = generate_gemini_response(query, f"{system}\n\nDocument: {context}\n\nTask: {query}")
-            if isinstance(gemini_result, str) and gemini_result.strip().startswith("**Error:**"):
-                raise RuntimeError(gemini_result.strip())
-            return gemini_result
-        except Exception as exc:
-            logger.warning("Gemini wiki fallback failed (%s).", exc)
-
+                logger.warning("Wiki LLM failed (%s). Falling back to NVIDIA.", exc)
+        
+        # Fallback: NVIDIA primary key
         if CHAT_API_KEY:
             try:
                 client = OpenAI(api_key=CHAT_API_KEY, base_url=CHAT_API_BASE_URL)
@@ -179,9 +180,27 @@ Be concise, accurate, and only use information from the document."""
                     ],
                     temperature=0.2, max_tokens=1500,
                 )
+                logger.info("Wiki LLM succeeded with NVIDIA primary key (%s)", CHAT_MODEL)
                 return r.choices[0].message.content
             except Exception as exc:
-                logger.warning("Chat API wiki fallback failed (%s).", exc)
+                logger.warning("NVIDIA primary key failed (%s). Trying fallback key.", exc)
+        
+        # Fallback: NVIDIA secondary key
+        if fallback_key:
+            try:
+                client = OpenAI(api_key=fallback_key, base_url=fallback_base_url)
+                r = client.chat.completions.create(
+                    model=fallback_model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": f"Document: {context}\n\nTask: {query}"},
+                    ],
+                    temperature=0.2, max_tokens=1500,
+                )
+                logger.info("Wiki LLM succeeded with NVIDIA fallback key (%s)", fallback_model)
+                return r.choices[0].message.content
+            except Exception as exc:
+                logger.warning("NVIDIA fallback key failed (%s).", exc)
 
         return "**Error:** Could not reach any wiki LLM provider. Please check API keys."
     return _llm
@@ -587,12 +606,22 @@ async def chat_stream(request: Request, body: dict):
             return _strip_graph_sections(_strip_missing_sentence(text))
 
         try:
-            if CHAT_API_KEY:
-                from openai import OpenAI
-                client = OpenAI(api_key=CHAT_API_KEY, base_url=CHAT_API_BASE_URL)
+            from openai import OpenAI
+            api_key = CHAT_API_KEY
+            api_base = CHAT_API_BASE_URL
+            model = CHAT_MODEL
+            
+            # Fallback to secondary NVIDIA key if primary fails
+            if not api_key:
+                api_key = os.getenv("CHAT_API_KEY_FALLBACK")
+                api_base = os.getenv("CHAT_API_BASE_URL_FALLBACK") or CHAT_API_BASE_URL
+                model = os.getenv("CHAT_MODEL_FALLBACK") or CHAT_MODEL
+            
+            if api_key:
+                client = OpenAI(api_key=api_key, base_url=api_base)
                 full = ""
                 stream = client.chat.completions.create(
-                    model=CHAT_MODEL,
+                    model=model,
                     messages=[
                         {"role": "system", "content": NVIDIA_SYSTEM_PROMPT},
                         {"role": "user",   "content": f"Context:\n{ctx}\n\nQuestion:\n{query}"},
@@ -604,7 +633,7 @@ async def chat_stream(request: Request, body: dict):
                     if delta:
                         full += delta
             else:
-                full = generate_gemini_response(query, f"Context:\n{ctx}\n\nQuestion:\n{query}")
+                raise ValueError("No NVIDIA API keys configured")
             full = _sanitize_stream_text(full)
             yield f"data: {json.dumps({'type':'token','content':full})}\n\n"
 

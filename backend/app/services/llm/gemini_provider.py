@@ -7,7 +7,9 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Client is initialized lazily inside generate_gemini_response() to avoid
+# failing at import time if GEMINI_API_KEY is not set
+client = None
 
 SYSTEM_PROMPT = """You are NeuralWiki, an AI assistant that answers questions using retrieved document context.
 
@@ -45,6 +47,13 @@ RESPONSE FORMATTING RULES — follow these exactly:
 
 
 def generate_gemini_response(query, context, model: str | None = None):
+    global client
+    
+    # Initialize client lazily on first call
+    if client is None:
+        if not GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY is not set. Cannot use Gemini as fallback.")
+        client = genai.Client(api_key=GEMINI_API_KEY)
 
     prompt = f"""{SYSTEM_PROMPT}
 

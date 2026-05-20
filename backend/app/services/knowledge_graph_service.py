@@ -57,18 +57,30 @@ except ImportError:
 _EXTRACT_API_KEY = os.getenv("EXTRACT_API_KEY") or os.getenv("MISTRAL_API_KEY")
 _EXTRACT_API_BASE_URL = os.getenv("EXTRACT_API_BASE_URL") or "https://api.mistral.ai/v1"
 _EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "mistral-small-latest")
+
+# Fallback NVIDIA for extraction
+_EXTRACT_API_KEY_FALLBACK = os.getenv("EXTRACT_API_KEY_FALLBACK")
+_EXTRACT_API_BASE_URL_FALLBACK = os.getenv("EXTRACT_API_BASE_URL_FALLBACK") or "https://integrate.api.nvidia.com/v1"
+_EXTRACT_MODEL_FALLBACK = os.getenv("EXTRACT_MODEL_FALLBACK", "nvidia/llama-3.1-nemotron-nano-8b-v1")
+
 _GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 _GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-_LLM_EXTRACTION_ENABLED = bool(_EXTRACT_API_KEY or _GEMINI_API_KEY)
+_LLM_EXTRACTION_ENABLED = bool(_EXTRACT_API_KEY or _EXTRACT_API_KEY_FALLBACK)
 if not _LLM_EXTRACTION_ENABLED:
-    logger.warning("EXTRACT_API_KEY and GEMINI_API_KEY are both missing — LLM entity/relation extraction disabled")
+    logger.warning("EXTRACT_API_KEY and fallback not configured — LLM entity/relation extraction disabled")
 else:
-    logger.info("LLM extraction enabled using %s", "EXTRACT_API_KEY" if _EXTRACT_API_KEY else "GEMINI_API_KEY")
+    logger.info("LLM extraction enabled with Mistral primary and NVIDIA fallback")
 
 
 def _extract_client():
     from openai import OpenAI
     return OpenAI(api_key=_EXTRACT_API_KEY, base_url=_EXTRACT_API_BASE_URL, max_retries=0)
+
+
+def _extract_client_fallback():
+    """Fallback NVIDIA client for extraction."""
+    from openai import OpenAI
+    return OpenAI(api_key=_EXTRACT_API_KEY_FALLBACK, base_url=_EXTRACT_API_BASE_URL_FALLBACK, max_retries=0)
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -79,6 +91,41 @@ def _is_rate_limit_error(exc: Exception) -> bool:
         or "capacity exceeded" in message
         or "service_tier_capacity_exceeded" in message
     )
+
+
+def _nvidia_entity_fallback(text: str) -> list[dict]:
+    """NVIDIA fallback for entity extraction."""
+    if not _EXTRACT_API_KEY_FALLBACK:
+        return []
+    try:
+        client = _extract_client_fallback()
+        resp = client.chat.completions.create(
+            model=_EXTRACT_MODEL_FALLBACK,
+            messages=[{"role": "user", "content": _LLM_ENTITY_PROMPT.format(text=text[:2500])}],
+            temperature=0.0,
+            max_tokens=600,
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = _json.loads(raw)
+        if not isinstance(parsed, list):
+            return []
+        out: list[dict] = []
+        seen: set[str] = set()
+        for item in parsed:
+            text_val = str(item.get("text", "")).strip()
+            type_val = str(item.get("type", "OTHER")).upper()
+            if len(text_val) < 2 or text_val.lower() in seen:
+                continue
+            seen.add(text_val.lower())
+            cluster = _LLM_TYPE_TO_CLUSTER.get(type_val, "MISC")
+            out.append({"text": text_val, "label": type_val, "_cluster": cluster, "_source": "nvidia_fallback"})
+        logger.info("NVIDIA entity fallback: %d entities extracted", len(out))
+        return out
+    except Exception as exc:
+        logger.warning("NVIDIA entity fallback failed: %s", exc)
+        return []
 
 
 def _gemini_entity_fallback(text: str) -> list[dict]:
@@ -105,6 +152,48 @@ def _gemini_entity_fallback(text: str) -> list[dict]:
         return out
     except Exception as exc:
         logger.warning("Gemini entity fallback failed: %s", exc)
+        return []
+
+
+def _nvidia_relationship_fallback(text: str, known: set[str], dm: dict[str, str]) -> list[dict]:
+    """NVIDIA fallback for relationship extraction."""
+    if not _EXTRACT_API_KEY_FALLBACK or len(known) < 2:
+        return []
+    try:
+        client = _extract_client_fallback()
+        prompt = _LLM_REL_PROMPT.format(entities=", ".join(sorted(known)[:40]), text=text[:2000])
+        resp = client.chat.completions.create(
+            model=_EXTRACT_MODEL_FALLBACK,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0, max_tokens=800,
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = _json.loads(raw)
+        if not isinstance(parsed, list):
+            return []
+        out: list[dict] = []
+        seen_pairs: set[tuple[str, str, str]] = set()
+        for r in parsed:
+            src_raw = str(r.get("source", "")).strip()
+            tgt_raw = str(r.get("target", "")).strip()
+            label = str(r.get("label", "")).strip()
+            if not src_raw or not tgt_raw or not label:
+                continue
+            src = dm.get(src_raw, src_raw)
+            tgt = dm.get(tgt_raw, tgt_raw)
+            if src not in known or tgt not in known or src == tgt:
+                continue
+            key = (min(src, tgt), max(src, tgt), label)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            out.append({"source": src, "target": tgt, "label": label, "weight": 3.0})
+        logger.info("NVIDIA relationship fallback: %d relationships extracted", len(out))
+        return out
+    except Exception as exc:
+        logger.warning("NVIDIA relationship fallback failed: %s", exc)
         return []
 
 
@@ -317,7 +406,11 @@ def _llm_extract_entities(text: str, window_size: int = 2500) -> list[dict]:
                 break
 
     if hit_rate_limit or not all_entities:
-        all_entities = _gemini_entity_fallback(text)
+        # Fallback 1: Try NVIDIA
+        all_entities = _nvidia_entity_fallback(text)
+        # Fallback 2: Try Gemini if NVIDIA also fails
+        if not all_entities:
+            all_entities = _gemini_entity_fallback(text)
 
     logger.info("LLM entity extraction: %d entities across %d windows", len(all_entities), len(windows))
     return all_entities
@@ -572,7 +665,11 @@ def _llm_extract_relationships(
                 break
 
     if hit_rate_limit or not all_rels:
-        all_rels = _gemini_relationship_fallback(text, known, dm)
+        # Fallback 1: Try NVIDIA
+        all_rels = _nvidia_relationship_fallback(text, known, dm)
+        # Fallback 2: Try Gemini if NVIDIA also fails
+        if not all_rels:
+            all_rels = _gemini_relationship_fallback(text, known, dm)
 
     logger.info("LLM relationship extraction: %d relationships across %d windows",
                 len(all_rels), len(windows))
