@@ -15,10 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy app code
 COPY backend/app ./app
-COPY backend/.env .env
 
 # Expose port (Render uses PORT env var)
 EXPOSE 8000
 
-# Run uvicorn
+# Run uvicorn (environment variables come from Render dashboard)
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
