@@ -1,5 +1,5 @@
 # Backend Dockerfile for Render
-FROM python:3.13
+FROM python:3.12
 
 WORKDIR /app
 
