@@ -38,18 +38,3 @@ services:
         value: https://integrate.api.nvidia.com/v1
       - key: EXTRACT_MODEL_FALLBACK
         value: nvidia/llama-3.1-nemotron-nano-8b-v1
-      - key: FRONTEND_URL
-        fromService:
-          name: neuralwiki-frontend
-          property: url
-
-  - type: static_site
-    name: neuralwiki-frontend
-    staticPublishPath: ./dist
-    buildCommand: npm install && npm run build
-    rootDir: ./frontend
-    envVars:
-      - key: VITE_API_URL
-        fromService:
-          name: neuralwiki-backend
-          property: url
