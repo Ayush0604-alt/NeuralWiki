@@ -3,6 +3,7 @@ import Upload from "./pages/Upload";
 import ChatBox from "./components/ChatBox";
 import KnowledgeGraph from "./components/KnowledgeGraph";
 import Wiki from "./components/Wiki";
+import { API_BASE_URL } from "./api/config";
 import "./App.css";
 
 const NAV = [
@@ -53,7 +54,7 @@ export default function App() {
   useState(() => {
     (async () => {
       try {
-        const res = await fetch("http://127.0.0.1:8000/");
+        const res = await fetch(`${API_BASE_URL}/`);
         setBackendStatus(res.ok ? "online" : "offline");
       } catch {
         setBackendStatus("offline");

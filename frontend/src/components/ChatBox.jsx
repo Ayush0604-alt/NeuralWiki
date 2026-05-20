@@ -1,7 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import * as d3 from "d3";
-
-const API = "http://127.0.0.1:8000";
+import { API_BASE_URL as API } from "../api/config";
 
 // ── Cluster colours (mirrors KnowledgeGraph.jsx) ──────────────────────────────
 const CLUSTER_CONFIG = {
